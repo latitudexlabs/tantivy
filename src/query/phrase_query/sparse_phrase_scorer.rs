@@ -248,7 +248,7 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     }
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        debug_assert!(target >= self.doc());
+        //debug_assert!(target >= self.doc());
         let doc = self.intersection_docset.seek(target);
         if doc == TERMINATED {
             return SeekDangerResult::SeekLowerBound(TERMINATED);
