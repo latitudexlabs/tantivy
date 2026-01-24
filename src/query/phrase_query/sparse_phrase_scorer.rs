@@ -65,8 +65,6 @@ pub struct SparsePhraSeScorer<TPostings: Postings> {
 /// 
 /// If any term cannot be matched in order, returns less than the total number of terms.
 fn count_ordered_terms(positions_per_term: &[Vec<u32>], expected_count: usize) -> u32 {
-    eprintln!("[count_ordered_terms] Input: {:?}, expected_count: {}", positions_per_term, expected_count);
-    
     if positions_per_term.is_empty() {
         return 0;
     }
@@ -177,7 +175,6 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
             .collect::<Vec<_>>();
         
         let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
-        eprintln!("[SparsePhraSeScorer] Creating scorer with {} terms, term_indices mapping: {:?}", num_docsets, term_indices);
         let mut scorer = SparsePhraSeScorer {
             intersection_docset,
             num_terms: num_docsets,
@@ -200,22 +197,13 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
 
     fn phrase_match(&mut self) -> bool {
         self.compute_matched_terms();
-        let matches = self.matched_term_count as usize == self.positions_per_term.len();
-        eprintln!("[phrase_match] Doc {}: {} (matched={}, required={})", 
-                  self.doc(), 
-                  if matches { "MATCH" } else { "NO MATCH" },
-                  self.matched_term_count, 
-                  self.positions_per_term.len());
-        matches
+        self.matched_term_count as usize == self.positions_per_term.len()
     }
 
     fn compute_matched_terms(&mut self) {
         // Collect positions for all terms in current document
         // We need to map from intersection docset indices (which are sorted by cost)
         // back to the original term indices
-        
-        let doc = self.doc();
-        eprintln!("[compute_matched_terms] Doc {}: Processing positions", doc);
         
         // Clear temporary positions without deallocating
         for positions in &mut self.temp_positions {
@@ -235,11 +223,8 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
             self.positions_per_term[i].extend_from_slice(&self.temp_positions[i]);
         }
 
-        eprintln!("[compute_matched_terms] Doc {}: Positions per term: {:?}", doc, self.positions_per_term);
-        
         // Count how many terms match in order
         self.matched_term_count = count_ordered_terms(&self.positions_per_term, self.num_terms);
-        eprintln!("[compute_matched_terms] Doc {}: Matched {} out of {} terms", doc, self.matched_term_count, self.num_terms);
     }
 }
 
@@ -247,9 +232,7 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     fn advance(&mut self) -> DocId {
         loop {
             let doc = self.intersection_docset.advance();
-            eprintln!("[advance] Checking doc: {}", doc);
             if doc == TERMINATED || self.phrase_match() {
-                eprintln!("[advance] Returning doc: {}", doc);
                 return doc;
             }
         }
@@ -257,9 +240,7 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc());
-        eprintln!("[seek] Seeking to target: {}", target);
         let doc = self.intersection_docset.seek(target);
-        eprintln!("[seek] Intersection returned doc: {}", doc);
         if doc == TERMINATED || self.phrase_match() {
             return doc;
         }

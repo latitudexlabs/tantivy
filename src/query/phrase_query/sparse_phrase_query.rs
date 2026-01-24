@@ -60,23 +60,6 @@ impl SparsePhraSeQuery {
         }
     }
 
-    /// Creates a new `SparsePhraSeQuery` given a list of terms and their offsets without sorting.
-    pub fn new_with_offset_nosort(terms: Vec<(usize, Term)>) -> SparsePhraSeQuery {
-        assert!(
-            terms.len() >= 2,
-            "A sparse phrase query must have at least two terms."
-        );
-        let field = terms[0].1.field();
-        assert!(
-            terms[1..].iter().all(|term| term.1.field() == field),
-            "All terms from a sparse phrase query must belong to the same field"
-        );
-        SparsePhraSeQuery {
-            field,
-            phrase_terms: terms,
-        }
-    }
-
     /// The [`Field`] this `SparsePhraSeQuery` is targeting.
     pub fn field(&self) -> Field {
         self.field
