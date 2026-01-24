@@ -45,21 +45,26 @@ pub struct SparsePhraSeScorer<TPostings: Postings> {
     intersection_docset: Intersection<PostingsWithOffset<TPostings>, PostingsWithOffset<TPostings>>,
     num_terms: usize,
     positions_per_term: Vec<Vec<u32>>,
+    temp_positions: Vec<Vec<u32>>,  // Reusable temporary buffer for positions
     matched_term_count: u32,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
+    /// Maps intersection docset indices back to original term indices
+    /// intersection_index -> original_term_index
+    term_indices: Vec<usize>,
 }
 
 /// Returns the count of terms that match in order.
 /// 
-/// This function finds the longest sequence of query terms that appear in order in the document,
-/// allowing some terms to be missing or non-consecutive.
+/// This function checks if all query terms appear in order in the document.
+/// It does not allow skipping terms - all terms must be present and in strictly increasing order.
 /// 
 /// Example: positions_per_term = [[1, 5], [3, 7], [10, 15]]
 /// This means term0 at [1,5], term1 at [3,7], term2 at [10,15]
-/// We can match: 1->3->10 (all 3) or skip term1: 1->10 (2 terms), or skip term0: 3->10 (2 terms), etc.
-/// We want the maximum, so return 3.
-fn count_ordered_terms(positions_per_term: &[Vec<u32>]) -> u32 {
+/// Returns 3 because we can find: 1->3->10 (all 3 in order)
+/// 
+/// If any term cannot be matched in order, returns less than the total number of terms.
+fn count_ordered_terms(positions_per_term: &[Vec<u32>], expected_count: usize) -> u32 {
     if positions_per_term.is_empty() {
         return 0;
     }
@@ -69,38 +74,51 @@ fn count_ordered_terms(positions_per_term: &[Vec<u32>]) -> u32 {
         return if positions_per_term[0].is_empty() { 0 } else { 1 };
     }
 
-    // Recursively find the longest subsequence where positions are strictly increasing
-    fn find_longest_chain(
+    // Find a chain where all terms appear in order
+    fn find_chain_all_terms(
         positions_per_term: &[Vec<u32>],
         term_idx: usize,
         last_pos: i32,
+        expected_count: usize,
+        matched_so_far: u32,
     ) -> u32 {
         if term_idx >= positions_per_term.len() {
             return 0;
         }
 
-        let mut best = 0;
-
-        // Option 1: Try to match current term (if it has a valid position)
-        for &pos in &positions_per_term[term_idx] {
-            if (pos as i32) > last_pos {
-                // Found a valid position for this term
-                let rest = find_longest_chain(positions_per_term, term_idx + 1, pos as i32);
-                best = best.max(1 + rest);
-                break; // Take the first valid position and move on
-            }
+        // Early termination: if we already matched all terms, return immediately
+        if matched_so_far as usize == expected_count {
+            return matched_so_far;
         }
 
-        // Option 2: Try skipping this term (if it's empty or doesn't match)
-        if positions_per_term[term_idx].is_empty() || best == 0 {
-            let skip = find_longest_chain(positions_per_term, term_idx + 1, last_pos);
-            best = best.max(skip);
+        // Current term must have at least one position after last_pos
+        let positions = &positions_per_term[term_idx];
+        if positions.is_empty() {
+            // Term not found, cannot match all terms
+            return 0;
         }
 
-        best
+        // Find the first position greater than last_pos
+        // Using binary search for better performance with many positions
+        let pos = positions.binary_search(&((last_pos + 1) as u32)).unwrap_or_else(|idx| idx);
+        
+        if pos < positions.len() {
+            // Found a valid position for this term
+            let rest = find_chain_all_terms(
+                positions_per_term,
+                term_idx + 1,
+                positions[pos] as i32,
+                expected_count,
+                matched_so_far + 1,
+            );
+            1 + rest
+        } else {
+            // No valid position found for this term, cannot match all terms
+            0
+        }
     }
 
-    find_longest_chain(positions_per_term, 0, -1)
+    find_chain_all_terms(positions_per_term, 0, -1, expected_count, 0)
 }
 
 impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
@@ -126,20 +144,46 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
             .unwrap_or(0)
             + offset;
         let num_docsets = term_postings_with_offset.len();
-        let postings_with_offsets = term_postings_with_offset
+        
+        // Create indexed postings to track original indices before sorting
+        let indexed_postings: Vec<(usize, PostingsWithOffset<TPostings>)> = term_postings_with_offset
             .into_iter()
-            .map(|(offset, postings)| {
+            .enumerate()
+            .map(|(idx, (offset, postings))| (
+                idx,
                 PostingsWithOffset::new(postings, (max_offset - offset) as u32)
-            })
+            ))
             .collect::<Vec<_>>();
+        
+        // Simulate the sorting that Intersection.new will do
+        let mut sorted_indexed = indexed_postings
+            .iter()
+            .enumerate()
+            .map(|(i, (orig_idx, postings))| (i, *orig_idx, postings.postings.cost()))
+            .collect::<Vec<_>>();
+        sorted_indexed.sort_by_key(|(_, _, cost)| *cost);
+        
+        // Build the mapping: sorted_position -> original_term_index
+        let term_indices: Vec<usize> = sorted_indexed
+            .iter()
+            .map(|(_, orig_idx, _)| *orig_idx)
+            .collect();
+        
+        let postings_with_offsets = indexed_postings
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>();
+        
         let intersection_docset = Intersection::new(postings_with_offsets, num_docs);
         let mut scorer = SparsePhraSeScorer {
             intersection_docset,
             num_terms: num_docsets,
             positions_per_term: vec![Vec::with_capacity(100); num_docsets],
+            temp_positions: vec![Vec::with_capacity(100); num_docsets],
             matched_term_count: 0u32,
             similarity_weight_opt,
             fieldnorm_reader,
+            term_indices,
         };
         if scorer.doc() != TERMINATED && !scorer.phrase_match() {
             scorer.advance();
@@ -158,15 +202,29 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
 
     fn compute_matched_terms(&mut self) {
         // Collect positions for all terms in current document
+        // We need to map from intersection docset indices (which are sorted by cost)
+        // back to the original term indices
+        
+        // Clear temporary positions without deallocating
+        for positions in &mut self.temp_positions {
+            positions.clear();
+        }
+        
+        for sorted_idx in 0..self.num_terms {
+            let original_term_idx = self.term_indices[sorted_idx];
+            self.intersection_docset
+                .docset_mut_specialized(sorted_idx)
+                .positions(&mut self.temp_positions[original_term_idx]);
+        }
+        
+        // Copy back to positions_per_term in original order
         for i in 0..self.num_terms {
             self.positions_per_term[i].clear();
-            self.intersection_docset
-                .docset_mut_specialized(i)
-                .positions(&mut self.positions_per_term[i]);
+            self.positions_per_term[i].extend_from_slice(&self.temp_positions[i]);
         }
 
         // Count how many terms match in order
-        self.matched_term_count = count_ordered_terms(&self.positions_per_term);
+        self.matched_term_count = count_ordered_terms(&self.positions_per_term, self.num_terms);
     }
 }
 
@@ -245,14 +303,14 @@ mod tests {
     fn test_count_ordered_terms_all_match() {
         // All terms in order
         let positions = vec![vec![1], vec![3], vec![5]];
-        assert_eq!(count_ordered_terms(&positions), 3);
+        assert_eq!(count_ordered_terms(&positions, 3), 3);
     }
 
     #[test]
     fn test_count_ordered_terms_partial_match() {
         // Skip middle term
         let positions = vec![vec![1], vec![2], vec![3]];
-        assert_eq!(count_ordered_terms(&positions), 3);
+        assert_eq!(count_ordered_terms(&positions, 3), 3);
     }
 
     #[test]
@@ -260,32 +318,32 @@ mod tests {
         // Term1 at [1,5], term2 at [3,7], term3 at [10,15]
         // Can match 1->3->10 or skip term2: 1->10, or other combinations
         let positions = vec![vec![1, 5], vec![3, 7], vec![10, 15]];
-        assert_eq!(count_ordered_terms(&positions), 3);
+        assert_eq!(count_ordered_terms(&positions, 3), 3);
     }
 
     #[test]
     fn test_count_ordered_terms_missing_term() {
         // Second term has no positions, can skip and match first and third
         let positions = vec![vec![1], vec![], vec![10]];
-        assert_eq!(count_ordered_terms(&positions), 2);
+        assert_eq!(count_ordered_terms(&positions, 3), 2);
     }
 
     #[test]
     fn test_count_ordered_terms_empty() {
         let positions: Vec<Vec<u32>> = vec![];
-        assert_eq!(count_ordered_terms(&positions), 0);
+        assert_eq!(count_ordered_terms(&positions, 0), 0);
     }
 
     #[test]
     fn test_count_ordered_terms_all_empty() {
         let positions = vec![vec![], vec![], vec![]];
-        assert_eq!(count_ordered_terms(&positions), 0);
+        assert_eq!(count_ordered_terms(&positions, 3), 0);
     }
 
     #[test]
     fn test_count_ordered_terms_single_term() {
         let positions = vec![vec![1, 2, 3]];
-        assert_eq!(count_ordered_terms(&positions), 1);
+        assert_eq!(count_ordered_terms(&positions, 1), 1);
     }
 
     #[test]
@@ -293,6 +351,6 @@ mod tests {
         // Term1 at [1, 10], Term2 at [2, 11], Term3 at [3, 12], Term4 at [4, 13]
         // Can match: 1->2->3->4 or 10->11->12->13, so all 4
         let positions = vec![vec![1, 10], vec![2, 11], vec![3, 12], vec![4, 13]];
-        assert_eq!(count_ordered_terms(&positions), 4);
+        assert_eq!(count_ordered_terms(&positions, 4), 4);
     }
 }
