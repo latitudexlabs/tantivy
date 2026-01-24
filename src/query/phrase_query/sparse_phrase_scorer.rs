@@ -249,15 +249,15 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
         debug_assert!(target >= self.doc());
-        let seek_res = self.intersection_docset.seek_danger(target);
-        if seek_res != SeekDangerResult::Found {
-            return seek_res;
+        let doc = self.intersection_docset.seek(target);
+        if doc == TERMINATED {
+            return SeekDangerResult::SeekLowerBound(TERMINATED);
         }
         // The intersection matched. Now let's see if we match the phrase.
         if self.phrase_match() {
             SeekDangerResult::Found
         } else {
-            SeekDangerResult::SeekLowerBound(target + 1)
+            SeekDangerResult::SeekLowerBound(doc + 1)
         }
     }
 
