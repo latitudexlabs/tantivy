@@ -266,16 +266,22 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     }
 
     fn size_hint(&self) -> u32 {
-        // Since we only need any terms in order, we get more hits than strict phrase
-        // so estimate is intersection divided by fewer terms
-        let estimate = self.intersection_docset.size_hint() / (self.num_terms as u32);
-        // But return at least the base estimate
-        estimate.max(self.intersection_docset.size_hint())
+        // We adjust the intersection estimate, since actual phrase hits are much lower than where
+        // the all appear.
+        // The estimate should depend on average field length, e.g. if the field is really short
+        // a phrase hit is more likely
+        self.intersection_docset.size_hint() / (10 * self.num_terms as u32)
     }
 
+    /// Returns a best-effort hint of the
+    /// cost to drive the docset.
     fn cost(&self) -> u64 {
-        // Cost is lower than strict phrase since we don't require adjacency
-        self.intersection_docset.size_hint() as u64 * (self.num_terms as u64)
+        // While determing a potential hit is cheap for phrases, evaluating an actual hit is
+        // expensive since it requires to load positions for a doc and check if they are next to
+        // each other.
+        // So the cost estimation would be the number of times we need to check if a doc is a hit *
+        // 10 * self.num_terms.
+        self.intersection_docset.size_hint() as u64 * 10 * self.num_terms as u64
     }
 }
 
