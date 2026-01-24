@@ -109,32 +109,44 @@ impl<TDocSet: DocSet, TOtherDocSet: DocSet> DocSet for Intersection<TDocSet, TOt
     fn advance(&mut self) -> DocId {
         let (left, right) = (&mut self.left, &mut self.right);
         let mut candidate = left.advance();
+        if candidate == TERMINATED {
+            return TERMINATED;
+        }
 
-        'outer: loop {
+        loop {
             // In the first part we look for a document in the intersection
             // of the two rarest `DocSet` in the intersection.
 
             loop {
-                let right_doc = right.seek(candidate);
-                candidate = left.seek(right_doc);
-                if candidate == right_doc {
+                if right.seek_into_the_danger_zone(candidate) {
                     break;
+                }
+                let right_doc = right.doc();
+                // TODO: Think about which value would make sense here
+                // It depends on the DocSet implementation, when a seek would outweigh an advance.
+                if right_doc > candidate.wrapping_add(100) {
+                    candidate = left.seek(right_doc);
+                } else {
+                    candidate = left.advance();
+                }
+                if candidate == TERMINATED {
+                    return TERMINATED;
                 }
             }
 
             debug_assert_eq!(left.doc(), right.doc());
-            // test the remaining scorers;
-            for docset in self.others.iter_mut() {
-                let seek_doc = docset.seek(candidate);
-                if seek_doc > candidate {
-                    candidate = left.seek(seek_doc);
-                    continue 'outer;
-                }
+            // test the remaining scorers
+            if self
+                .others
+                .iter_mut()
+                .all(|docset| docset.seek_into_the_danger_zone(candidate))
+            {
+                debug_assert_eq!(candidate, self.left.doc());
+                debug_assert_eq!(candidate, self.right.doc());
+                debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
+                return candidate;
             }
-            debug_assert_eq!(candidate, self.left.doc());
-            debug_assert_eq!(candidate, self.right.doc());
-            debug_assert!(self.others.iter().all(|docset| docset.doc() == candidate));
-            return candidate;
+            candidate = left.advance();
         }
     }
 
