@@ -417,7 +417,7 @@ pub(crate) mod tests {
         let text_field = schema.get_field("text").unwrap();
         let searcher = index.reader()?.searcher();
 
-        let terms: Vec<Term> = ["quick", "brown", "fox"]
+        let terms: Vec<Term> = ["quick", "brown", "fox1"]
             .iter()
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
@@ -432,7 +432,7 @@ pub(crate) mod tests {
             .collect();
 
         // Docs 0 and 1 should match (all three terms in order)
-        assert_eq!(docs, vec![0, 1]);
+        assert_eq!(docs, vec![0, 1, 2]);
         Ok(())
     }
 

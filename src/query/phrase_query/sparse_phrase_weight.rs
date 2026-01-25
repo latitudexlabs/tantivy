@@ -47,25 +47,30 @@ impl SparsePhraSeWeight {
             .map(|similarity_weight| similarity_weight.boost_by(boost));
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
         let mut term_postings_list = Vec::new();
+        let total_terms = self.phrase_terms.len();
+        
+        // Try to read postings for each term, tracking which ones exist
         for &(offset, ref term) in &self.phrase_terms {
             if let Some(postings) = reader
                 .inverted_index(term.field())?
                 .read_postings(term, IndexRecordOption::WithFreqsAndPositions)?
             {
-                term_postings_list.push((offset, postings));
+                term_postings_list.push((offset, Some(postings)));
             } else {
-                // For sparse phrase, missing terms are ok - just skip this term
+                // For sparse phrase, missing terms are ok - track them as None
                 // This is different from regular phrase where any missing term means no match
+                term_postings_list.push((offset, None));
             }
         }
         
-        // We need at least one term
-        if term_postings_list.is_empty() {
+        // Check if we have at least one term available
+        if term_postings_list.iter().all(|(_, p)| p.is_none()) {
             return Ok(None);
         }
 
         Ok(Some(SparsePhraSeScorer::new(
             term_postings_list,
+            total_terms,
             similarity_weight_opt,
             fieldnorm_reader,
         )))
