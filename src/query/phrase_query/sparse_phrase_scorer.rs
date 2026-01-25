@@ -5,115 +5,160 @@ use crate::query::bm25::Bm25Weight;
 use crate::query::Scorer;
 use crate::{DocId, Score};
 
+struct PostingsWithOffset<TPostings> {
+    offset: u32,
+    postings: TPostings,
+}
+
+impl<TPostings: Postings> PostingsWithOffset<TPostings> {
+    pub fn new(
+        segment_postings: TPostings,
+        offset: u32,
+        _original_index: usize,
+    ) -> PostingsWithOffset<TPostings> {
+        PostingsWithOffset {
+            offset,
+            postings: segment_postings,
+        }
+    }
+
+    pub fn positions(&mut self, output: &mut Vec<u32>) {
+        self.postings.positions_with_offset(self.offset, output)
+    }
+}
+
+impl<TPostings: Postings> DocSet for PostingsWithOffset<TPostings> {
+    fn advance(&mut self) -> DocId {
+        self.postings.advance()
+    }
+
+    fn seek(&mut self, target: DocId) -> DocId {
+        self.postings.seek(target)
+    }
+
+    fn doc(&self) -> DocId {
+        self.postings.doc()
+    }
+
+    fn size_hint(&self) -> u32 {
+        self.postings.size_hint()
+    }
+}
+
 pub struct SparsePhraSeScorer<TPostings: Postings> {
-    /// Optional postings for each term (None if term is missing from index)
-    term_postings: Vec<Option<TPostings>>,
-    /// Tracks which postings exist
-    existing_postings_indices: Vec<usize>,
-    /// Index of primary postings in term_postings (cached for performance)
-    primary_idx: usize,
-    /// Current document across all postings
-    current_doc: DocId,
+    postings_with_offset: Vec<PostingsWithOffset<TPostings>>,
     num_terms: usize,
-    total_terms: usize,
     positions_per_term: Vec<Vec<u32>>,
     matched_term_count: u32,
     fieldnorm_reader: FieldNormReader,
     similarity_weight_opt: Option<Bm25Weight>,
+    current_doc: DocId,
 }
 
-/// Returns the count of terms that match in order, allowing for missing terms (from the index).
-/// 
-/// A document matches if it contains all PRESENT terms from the query appearing in the correct order.
-/// "Missing terms" (terms not found in a specific document due to their positions being empty) 
-/// can be skipped. However, if a term IS present in the document but appears out of order
-/// relative to other present terms, the match fails and returns 0.
-/// 
-/// Uses an iterative approach for better performance than recursion.
-/// 
-/// Example: positions_per_term = [[1, 5], [], [10, 15]]
-/// This means term0 at [1,5], term1 missing, term2 at [10,15]
-/// Returns 2 because term0(1) < term2(10), skipping the missing term1
-/// 
-/// Example: positions_per_term = [[1], [0], [2]]
-/// term0(1), term1(0), term2(2) - term1 is out of order relative to term0
-/// Returns 0 because not all terms can be matched in order
+/// Returns the count of terms that match in order.
+///
+/// This function finds the longest sequence of query terms that appear in order in the document,
+/// allowing some terms to be missing or non-consecutive.
+///
+/// Example: positions_per_term = [[1, 5], [3, 7], [10, 15]]
+/// This means term0 at [1,5], term1 at [3,7], term2 at [10,15]
+/// We can match: 1->3->10 (all 3) or skip term1: 1->10 (2 terms), or skip term0: 3->10 (2 terms), etc.
+/// We want the maximum, so return 3.
 fn count_ordered_terms(positions_per_term: &[Vec<u32>]) -> u32 {
     if positions_per_term.is_empty() {
         return 0;
     }
 
-    let mut last_pos: i32 = -1;
-    let mut matched_count = 0u32;
-
-    for positions in positions_per_term {
-        if positions.is_empty() {
-            // Term is missing in this document, skip it and continue
-            continue;
-        }
-
-        // Term is present in the document
-        // Find the first position greater than last_pos
-        let search_val = (last_pos + 1) as u32;
-        let pos = positions.binary_search(&search_val).unwrap_or_else(|idx| idx);
-
-        if pos < positions.len() {
-            // Found a valid position for this term that maintains order
-            last_pos = positions[pos] as i32;
-            matched_count += 1;
+    // If only one term, count it if it has positions
+    if positions_per_term.len() == 1 {
+        return if positions_per_term[0].is_empty() {
+            0
         } else {
-            // No valid position found for this term
-            // This means the document is out of order
-            return 0;
-        }
+            1
+        };
     }
 
-    matched_count
+    // Recursively find the longest subsequence where positions are strictly increasing.
+    // Missing terms may be skipped, but terms present in the document must respect the order.
+    fn find_longest_chain(positions_per_term: &[Vec<u32>], term_idx: usize, last_pos: i32) -> u32 {
+        if term_idx >= positions_per_term.len() {
+            return 0;
+        }
+
+        let positions = &positions_per_term[term_idx];
+        let mut best = 0u32;
+        let mut has_progress = false;
+
+        for &pos in positions.iter().filter(|&&pos| (pos as i32) > last_pos) {
+            has_progress = true;
+            let rest = find_longest_chain(positions_per_term, term_idx + 1, pos as i32);
+            best = best.max(1 + rest);
+        }
+
+        if positions.is_empty() {
+            // Term missing in the document: skipping is allowed.
+            best = best.max(find_longest_chain(positions_per_term, term_idx + 1, last_pos));
+        } else if !has_progress {
+            // Term is present but only before `last_pos`; order cannot be satisfied.
+            return 0;
+        }
+
+        best
+    }
+
+    find_longest_chain(positions_per_term, 0, -1)
 }
 
 impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
     pub fn new(
-        term_postings_with_option: Vec<(usize, Option<TPostings>)>,
-        total_terms: usize,
+        term_postings: Vec<(usize, TPostings)>,
         similarity_weight_opt: Option<Bm25Weight>,
         fieldnorm_reader: FieldNormReader,
     ) -> SparsePhraSeScorer<TPostings> {
-        // Extract just the postings, tracking which indices have actual postings
-        let mut term_postings = Vec::new();
-        let mut existing_postings_indices = Vec::new();
-        
-        for (idx, (_, postings_opt)) in term_postings_with_option.into_iter().enumerate() {
-            if postings_opt.is_some() {
-                existing_postings_indices.push(idx);
-            }
-            term_postings.push(postings_opt);
-        }
-        
-        let num_terms = term_postings.len();
-        let primary_idx = if existing_postings_indices.is_empty() {
-            0
-        } else {
-            existing_postings_indices[0]
-        };
-        
+        Self::new_with_offset(term_postings, similarity_weight_opt, fieldnorm_reader, 0)
+    }
+
+    pub(crate) fn new_with_offset(
+        term_postings_with_offset: Vec<(usize, TPostings)>,
+        similarity_weight_opt: Option<Bm25Weight>,
+        fieldnorm_reader: FieldNormReader,
+        offset: usize,
+    ) -> SparsePhraSeScorer<TPostings> {
+        let max_offset = term_postings_with_offset
+            .iter()
+            .map(|&(offset, _)| offset)
+            .max()
+            .unwrap_or(0)
+            + offset;
+
+        let postings_with_offset: Vec<PostingsWithOffset<TPostings>> = term_postings_with_offset
+            .into_iter()
+            .map(|(term_offset, postings)| {
+                // Normalize so that earlier offsets get larger added value, preserving ordering.
+                PostingsWithOffset::new(postings, (max_offset - term_offset) as u32, term_offset)
+            })
+            .collect();
+
+        let postings_with_offset = postings_with_offset;
+
+        let num_terms = postings_with_offset.len();
         let mut scorer = SparsePhraSeScorer {
-            term_postings,
-            existing_postings_indices,
-            primary_idx,
-            current_doc: TERMINATED,
+            postings_with_offset,
             num_terms,
-            total_terms,
             positions_per_term: vec![Vec::with_capacity(100); num_terms],
             matched_term_count: 0u32,
-            fieldnorm_reader,
             similarity_weight_opt,
+            fieldnorm_reader,
+            current_doc: TERMINATED,
         };
-        
-        // Initialize to first valid document
-        if !scorer.existing_postings_indices.is_empty() {
-            scorer.advance();
+
+        scorer.current_doc = scorer.find_next_doc(0);
+        if scorer.current_doc != TERMINATED {
+            scorer.compute_matched_terms();
+            if scorer.matched_term_count < 2 {
+                scorer.advance();
+            }
         }
-        
         scorer
     }
 
@@ -121,214 +166,93 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
         self.matched_term_count
     }
 
-    fn phrase_match(&mut self, doc: DocId) -> bool {
-        let expected_count = self.existing_postings_indices.len();
-        // Early termination: if no existing postings, no match
-        if expected_count == 0 {
-            return false;
+    fn find_next_doc(&mut self, target: DocId) -> DocId {
+        let mut next_doc = TERMINATED;
+        for postings in &mut self.postings_with_offset {
+            let doc = if postings.doc() < target {
+                postings.seek(target)
+            } else {
+                postings.doc()
+            };
+            if doc < next_doc {
+                next_doc = doc;
+            }
         }
-        
-        self.compute_matched_terms(doc);
-        // Match only if all existing terms (that have postings) are matched in order
-        self.matched_term_count as usize == expected_count
+        next_doc
     }
 
-    fn compute_matched_terms(&mut self, doc: DocId) {
-        // Collect positions for all terms in current document
-        for positions in &mut self.positions_per_term {
-            positions.clear();
+    fn compute_matched_terms(&mut self) {
+        if self.current_doc == TERMINATED {
+            self.matched_term_count = 0;
+            return;
         }
-        
-        for (idx, postings_opt) in self.term_postings.iter_mut().enumerate() {
-            if let Some(postings) = postings_opt {
-                if postings.doc() == doc {
-                    postings.positions(&mut self.positions_per_term[idx]);
-                }
+
+        for (i, postings) in self.postings_with_offset.iter_mut().enumerate() {
+            self.positions_per_term[i].clear();
+            if postings.doc() == self.current_doc {
+                postings.positions(&mut self.positions_per_term[i]);
             }
         }
 
-        // Count how many terms match in order (allowing missing terms)
         self.matched_term_count = count_ordered_terms(&self.positions_per_term);
+    }
+
+    fn matches_doc(&self) -> bool {
+        let all_terms_present = self
+            .positions_per_term
+            .iter()
+            .all(|positions| !positions.is_empty());
+
+        if all_terms_present {
+            // If all query terms occur in the doc, they must appear in-order.
+            self.matched_term_count as usize == self.num_terms
+        } else {
+            // Otherwise accept partial matches of length >= 2 in order.
+            self.matched_term_count >= 2
+        }
     }
 }
 
 impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     fn advance(&mut self) -> DocId {
-        if self.existing_postings_indices.is_empty() {
-            self.current_doc = TERMINATED;
-            return TERMINATED;
-        }
-
-        // Find the next document where all existing terms appear and phrase matches
-        // Use cached primary_idx for performance
-        let primary_idx = self.primary_idx;
-        
-        // For the first call, we need to sync all terms to the first common document
-        // For subsequent calls, we advance and then sync
-        let mut doc = if self.current_doc == TERMINATED {
-            // First call: seek all postings to doc 0 to check if it matches
-            for &idx in &self.existing_postings_indices {
-                if let Some(postings) = &mut self.term_postings[idx] {
-                    let _ = postings.seek(0);
-                }
-            }
-            0
-        } else {
-            // Subsequent calls: advance primary
-            if let Some(postings) = &mut self.term_postings[primary_idx] {
-                postings.advance()
-            } else {
-                TERMINATED
-            }
-        };
-        
         loop {
-            if doc == TERMINATED {
-                self.current_doc = TERMINATED;
+            self.current_doc = match self.current_doc {
+                TERMINATED => TERMINATED,
+                doc => self.find_next_doc(doc + 1),
+            };
+            if self.current_doc == TERMINATED {
                 return TERMINATED;
             }
-            
-            // Sync all other existing terms to this doc
-            loop {
-                let mut max_doc = doc;
-                let mut all_synced = true;
-                
-                // Check if all other existing terms are at or past this doc
-                for &idx in &self.existing_postings_indices[1..] {
-                    if let Some(postings) = &mut self.term_postings[idx] {
-                        let other_doc = postings.seek(doc);
-                        if other_doc == TERMINATED {
-                            self.current_doc = TERMINATED;
-                            return TERMINATED;
-                        }
-                        if other_doc > max_doc {
-                            max_doc = other_doc;
-                            all_synced = false;
-                        }
-                    }
-                }
-                
-                if all_synced {
-                    // All terms are at this document
-                    break;
-                }
-                
-                // Some terms are ahead, need to seek primary to catch up
-                let new_doc = if let Some(postings) = &mut self.term_postings[primary_idx] {
-                    postings.seek(max_doc)
-                } else {
-                    TERMINATED
-                };
-                
-                if new_doc == TERMINATED || new_doc > max_doc {
-                    self.current_doc = TERMINATED;
-                    return TERMINATED;
-                }
-                
-                doc = new_doc;
-            }
-            
-            // All existing terms are now at the same document
-            // Check if the phrase matches
-            if self.phrase_match(doc) {
-                self.current_doc = doc;
-                return doc;
-            }
-            
-            // Try next document
-            if let Some(postings) = &mut self.term_postings[primary_idx] {
-                doc = postings.advance();
-            } else {
-                self.current_doc = TERMINATED;
-                return TERMINATED;
+            self.compute_matched_terms();
+            if self.matches_doc() {
+                return self.current_doc;
             }
         }
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
-        debug_assert!(target >= self.current_doc);
-        
-        if self.existing_postings_indices.is_empty() {
-            self.current_doc = TERMINATED;
+        debug_assert!(target >= self.doc());
+        self.current_doc = self.find_next_doc(target);
+        if self.current_doc == TERMINATED {
             return TERMINATED;
         }
-
-        // Seek primary to target
-        // Use cached primary_idx for performance
-        let primary_idx = self.primary_idx;
-        let mut doc = if let Some(postings) = &mut self.term_postings[primary_idx] {
-            postings.seek(target)
+        self.compute_matched_terms();
+        if self.matches_doc() {
+            self.current_doc
         } else {
-            TERMINATED
-        };
-        
-        if doc == TERMINATED {
-            self.current_doc = TERMINATED;
-            return TERMINATED;
-        }
-        
-        loop {
-            // Seek other terms to current document  
-            let mut max_doc = doc;
-            let mut all_at_doc = true;
-            
-            for &idx in &self.existing_postings_indices[1..] {
-                if let Some(postings) = &mut self.term_postings[idx] {
-                    let other_doc = postings.seek(doc);
-                    if other_doc == TERMINATED {
-                        self.current_doc = TERMINATED;
-                        return TERMINATED;
-                    }
-                    if other_doc > max_doc {
-                        max_doc = other_doc;
-                        all_at_doc = false;
-                    }
-                }
-            }
-            
-            if all_at_doc {
-                // All terms at this document
-                if self.phrase_match(doc) {
-                    self.current_doc = doc;
-                    return doc;
-                }
-                // Try next document
-                if let Some(postings) = &mut self.term_postings[primary_idx] {
-                    doc = postings.advance();
-                } else {
-                    self.current_doc = TERMINATED;
-                    return TERMINATED;
-                }
-                if doc == TERMINATED {
-                    self.current_doc = TERMINATED;
-                    return TERMINATED;
-                }
-            } else {
-                // Some terms are ahead, seek primary to max_doc
-                if let Some(postings) = &mut self.term_postings[primary_idx] {
-                    doc = postings.seek(max_doc);
-                } else {
-                    self.current_doc = TERMINATED;
-                    return TERMINATED;
-                }
-                if doc == TERMINATED {
-                    self.current_doc = TERMINATED;
-                    return TERMINATED;
-                }
-            }
+            self.advance()
         }
     }
 
     fn seek_danger(&mut self, target: DocId) -> SeekDangerResult {
-        match self.seek(target) {
-            TERMINATED => SeekDangerResult::SeekLowerBound(target),
-            found_doc => {
-                if found_doc >= target {
-                    SeekDangerResult::Found
-                } else {
-                    SeekDangerResult::SeekLowerBound(found_doc + 1)
-                }
-            }
+        debug_assert!(target >= self.doc());
+        let doc = self.seek(target);
+        if doc == target {
+            SeekDangerResult::Found
+        } else if doc == TERMINATED {
+            SeekDangerResult::SeekLowerBound(TERMINATED)
+        } else {
+            SeekDangerResult::SeekLowerBound(doc)
         }
     }
 
@@ -337,21 +261,21 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     }
 
     fn size_hint(&self) -> u32 {
-        if !self.existing_postings_indices.is_empty() {
-            if let Some(postings) = &self.term_postings[self.primary_idx] {
-                return postings.size_hint() / (10 * self.num_terms as u32).max(1);
-            }
-        }
-        0
+        self.postings_with_offset
+            .iter()
+            .map(DocSet::size_hint)
+            .max()
+            .unwrap_or(0)
     }
 
+    /// Returns a best-effort hint of the
+    /// cost to drive the docset.
     fn cost(&self) -> u64 {
-        if !self.existing_postings_indices.is_empty() {
-            if let Some(postings) = &self.term_postings[self.primary_idx] {
-                return postings.size_hint() as u64 * 10 * self.num_terms as u64;
-            }
-        }
-        0
+        self.postings_with_offset
+            .iter()
+            .map(DocSet::cost)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -359,15 +283,14 @@ impl<TPostings: Postings> Scorer for SparsePhraSeScorer<TPostings> {
     fn score(&mut self) -> Score {
         let doc = self.doc();
         let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);
-        
         if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
             // Score proportional to number of matched terms
-            // matched_term_count / total_terms gives a ratio, multiply by base BM25 score
-            let term_match_ratio = self.matched_term_count as f32 / self.total_terms as f32;
+            // matched_term_count / num_terms gives a ratio, multiply by base BM25 score
+            let term_match_ratio = self.matched_term_count as f32 / self.num_terms as f32;
             similarity_weight.score(fieldnorm_id, self.matched_term_count) * term_match_ratio
         } else {
             // When scoring disabled, return ratio of matched terms
-            self.matched_term_count as f32 / self.total_terms as f32
+            self.matched_term_count as f32 / self.num_terms as f32
         }
     }
 }
