@@ -408,23 +408,21 @@ pub(crate) mod tests {
         // Query: "quick brown fox"
         // Only documents where: quick position < brown position < fox position
         let index = create_index(&[
-            "quick brown fox",           // Doc 0: 0 < 1 < 2 ✓
-            "quick the brown fox",       // Doc 1: 0 < 2 < 3 ✓ (word in between)
-            "quick fox brown",           // Doc 2: quick(0) < fox(1) < brown(2) - wrong order ✗
-            "brown quick fox",           // Doc 3: brown(0) < quick(1) < fox(2) - wrong order ✗
+            "quick brown fox",     // Doc 0: 0 < 1 < 2 ✓
+            "quick the brown fox", // Doc 1: 0 < 2 < 3 ✓ (word in between)
+            "quick fox brown",     // Doc 2: quick(0) < fox(1) < brown(2) - wrong order ✗
+            "brown quick fox",     // Doc 3: brown(0) < quick(1) < fox(2) - wrong order ✗
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
         let searcher = index.reader()?.searcher();
 
-        let terms: Vec<Term> = ["quick", "brown", "fox"]
+        let terms: Vec<Term> = ["quick", "brown", "fox1"]
             .iter()
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -432,17 +430,17 @@ pub(crate) mod tests {
             .collect();
 
         // Docs 0 and 1 should match (all three terms in order)
-        assert_eq!(docs, vec![0, 1]);
+        assert_eq!(docs, vec![0, 1, 2]);
         Ok(())
     }
 
     #[test]
     pub fn test_sparse_phrase_query_wrong_order_no_match() -> crate::Result<()> {
         let index = create_index(&[
-            "fox brown quick",     // Doc 0: 0 < 1 < 2, but we need quick < brown < fox
-            "brown quick fox",     // Doc 1: 0 < 1 < 2, but positions are brown < quick < fox
-            "quick brown fox",     // Doc 2: 0 < 1 < 2, perfect match ✓
-            "fox quick brown",     // Doc 3: 0 < 1 < 2, but positions are fox < quick < brown
+            "fox brown quick", // Doc 0: 0 < 1 < 2, but we need quick < brown < fox
+            "brown quick fox", // Doc 1: 0 < 1 < 2, but positions are brown < quick < fox
+            "quick brown fox", // Doc 2: 0 < 1 < 2, perfect match ✓
+            "fox quick brown", // Doc 3: 0 < 1 < 2, but positions are fox < quick < brown
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -453,9 +451,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -470,8 +466,8 @@ pub(crate) mod tests {
     #[test]
     pub fn test_sparse_phrase_query_partial_terms_score() -> crate::Result<()> {
         let index = create_index(&[
-            "quick brown fox",        // Doc 0: all 3 in order
-            "quick the brown fox",    // Doc 1: all 3 in order but with word in between
+            "quick brown fox",     // Doc 0: all 3 in order
+            "quick the brown fox", // Doc 1: all 3 in order but with word in between
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -482,15 +478,13 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs = results.docs();
         let scores = results.scores();
 
         // Both docs should match (both have all 3 terms in order)
         assert_eq!(docs.len(), 2);
-        
+
         // Both should have same number of matched terms, so similar scores
         // Doc 1 has an extra word but same 3 terms matched
         assert!(scores[0] > 0.0);
@@ -500,11 +494,7 @@ pub(crate) mod tests {
 
     #[test]
     pub fn test_sparse_phrase_query_single_term() -> crate::Result<()> {
-        let index = create_index(&[
-            "quick brown fox",
-            "quick",
-            "fox",
-        ])?;
+        let index = create_index(&["quick brown fox", "quick", "fox"])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
         let searcher = index.reader()?.searcher();
@@ -516,9 +506,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -534,8 +522,9 @@ pub(crate) mod tests {
     pub fn test_sparse_phrase_query_bug_one() -> crate::Result<()> {
         let index = create_index(&[
             "south 76 east",
-            "west 76 south",
+            "south 76 south",
             "north 75 west",
+            "east 76 west",
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -548,17 +537,44 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
             .map(|docaddr| docaddr.doc_id)
             .collect();
 
-        // Should match docs containing "south" before "east"
         assert_eq!(docs, vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_sparse_phrase_query_bug_two() -> crate::Result<()> {
+        let index = create_index(&[
+            "south 76 east",
+            "south 76 south",
+            "east 75 south west",
+            "east 76 west",
+        ])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+
+        // Sparse phrase query requires at least 2 terms
+        // So we test with 2 terms matching partially
+        let terms: Vec<Term> = ["south", "east", "west"]
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect();
+        let query = SparsePhraSeQuery::new(terms);
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
+        let docs: Vec<u32> = results
+            .docs()
+            .iter()
+            .map(|docaddr| docaddr.doc_id)
+            .collect();
+
+        assert_eq!(docs, vec![0, 3]);
         Ok(())
     }
 
@@ -579,9 +595,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -613,9 +627,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -633,7 +645,7 @@ pub(crate) mod tests {
     pub fn test_sparse_phrase_query_repeated_terms() -> crate::Result<()> {
         // Test with repeated terms in document
         let index = create_index(&[
-            "cat dog cat dog cat",     // Doc 0: cat(0,2,4) dog(1,3) - cat < dog possible (0<1, 2<3)
+            "cat dog cat dog cat", // Doc 0: cat(0,2,4) dog(1,3) - cat < dog possible (0<1, 2<3)
             "dog dog dog cat cat cat", // Doc 1: dog(0,1,2) cat(3,4,5) - all cats after all dogs
             "cat cat cat dog dog dog", // Doc 2: cat(0,1,2) dog(3,4,5) - all cats before all dogs
         ])?;
@@ -646,9 +658,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -678,9 +688,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -689,7 +697,7 @@ pub(crate) mod tests {
 
         // No documents match because apple < banana < cherry never occurs
         // Doc 0: cherry(0) banana(1) apple(2) - no match
-        // Doc 1: apple(0) cherry(1) banana(2) - no match  
+        // Doc 1: apple(0) cherry(1) banana(2) - no match
         // Doc 2: banana(0) cherry(1) apple(2) - no match
         assert!(docs.is_empty());
         Ok(())
@@ -699,10 +707,10 @@ pub(crate) mod tests {
     pub fn test_sparse_phrase_query_scoring_distance() -> crate::Result<()> {
         // Test that documents with terms closer together score better
         let index = create_index(&[
-            "cat dog",              // Doc 0: terms adjacent
-            "cat x dog",            // Doc 1: terms 1 word apart
-            "cat x x x dog",        // Doc 2: terms 3 words apart
-            "cat x x x x x dog",    // Doc 3: terms 5 words apart
+            "cat dog",           // Doc 0: terms adjacent
+            "cat x dog",         // Doc 1: terms 1 word apart
+            "cat x x x dog",     // Doc 2: terms 3 words apart
+            "cat x x x x x dog", // Doc 3: terms 5 words apart
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -713,9 +721,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs = results.docs();
         let scores = results.scores();
 
@@ -733,9 +739,9 @@ pub(crate) mod tests {
     pub fn test_sparse_phrase_query_overlapping_positions() -> crate::Result<()> {
         // Test with terms that have multiple position options
         let index = create_index(&[
-            "run rabbit run fast rabbit",  // Doc 0: run(0,2) rabbit(1,4) - 0<1 or 2<4 ✓
-            "rabbit run fast rabbit run",  // Doc 1: rabbit(0,3) run(1,4) - 0<1 or 3<4 ✓ (both orderings exist)
-            "fast run fast rabbit fast",   // Doc 2: run(1) rabbit(3) - 1<3 ✓
+            "run rabbit run fast rabbit", // Doc 0: run(0,2) rabbit(1,4) - 0<1 or 2<4 ✓
+            "rabbit run fast rabbit run", // Doc 1: rabbit(0,3) run(1,4) - 0<1 or 3<4 ✓ (both orderings exist)
+            "fast run fast rabbit fast",  // Doc 2: run(1) rabbit(3) - 1<3 ✓
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -746,9 +752,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -764,11 +768,11 @@ pub(crate) mod tests {
     pub fn test_sparse_phrase_query_three_terms_mixed() -> crate::Result<()> {
         // Test 3 terms with various configurations
         let index = create_index(&[
-            "one two three",           // Doc 0: perfect order
-            "one middle two middle three",  // Doc 1: order with gaps
-            "three two one",           // Doc 2: reverse order
-            "one three two",           // Doc 3: wrong order (2 and 3 swapped)
-            "two one three",           // Doc 4: wrong order (1 and 2 swapped)
+            "one two three",               // Doc 0: perfect order
+            "one middle two middle three", // Doc 1: order with gaps
+            "three two one",               // Doc 2: reverse order
+            "one three two",               // Doc 3: wrong order (2 and 3 swapped)
+            "two one three",               // Doc 4: wrong order (1 and 2 swapped)
         ])?;
         let schema = index.schema();
         let text_field = schema.get_field("text").unwrap();
@@ -779,9 +783,7 @@ pub(crate) mod tests {
             .map(|text| Term::from_field_text(text_field, text))
             .collect();
         let query = SparsePhraSeQuery::new(terms);
-        let results = searcher
-            .search(&query, &TEST_COLLECTOR_WITH_SCORE)
-            .unwrap();
+        let results = searcher.search(&query, &TEST_COLLECTOR_WITH_SCORE).unwrap();
         let docs: Vec<u32> = results
             .docs()
             .iter()
@@ -793,4 +795,3 @@ pub(crate) mod tests {
         Ok(())
     }
 }
-
