@@ -66,7 +66,7 @@ impl<TPostings: Postings> Postings for PostingsWithOffset<TPostings> {
 }
 
 pub struct SparsePhraSeScorer<TPostings: Postings> {
-    // All postings - we'll use the first (smallest) as primary driver
+    // All postings sorted by size - smallest first for optimal performance
     all_postings: Vec<PostingsWithOffset<TPostings>>,
     num_terms: usize,
     positions_per_term: Vec<Vec<u32>>,
@@ -163,7 +163,7 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
 
         let num_terms = all_postings.len();
 
-        // Sort by size - smallest first for efficient iteration
+        // Sort by size - smallest first for efficient skipping
         all_postings.sort_by_key(|p| p.size_hint());
 
         let mut scorer = SparsePhraSeScorer {
@@ -177,67 +177,67 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
         };
 
         // Find first matching doc
-        scorer.current_doc = scorer.find_next_matching_doc(0);
+        scorer.current_doc = scorer.find_next_matching_doc();
         scorer
-    }
-
-    /// Find the next document that matches the sparse phrase criteria.
-    /// Optimized: Uses efficient seeking instead of naive iteration.
-    fn find_next_matching_doc(&mut self, mut start_from: DocId) -> DocId {
-        'outer: loop {
-            // Find minimum doc >= start_from across all postings
-            let mut min_doc = TERMINATED;
-            for postings in &mut self.all_postings {
-                let doc = if postings.doc() < start_from {
-                    postings.seek(start_from)
-                } else {
-                    postings.doc()
-                };
-                if doc < min_doc {
-                    min_doc = doc;
-                }
-            }
-
-            if min_doc == TERMINATED {
-                return TERMINATED;
-            }
-
-            // Check if this candidate matches our criteria
-            // First, quickly count how many postings are at this doc
-            let mut count_at_doc = 0u32;
-            for postings in &self.all_postings {
-                if postings.doc() == min_doc {
-                    count_at_doc += 1;
-                    if count_at_doc >= 2 {
-                        // Early exit: we have at least 2 terms, worth checking positions
-                        break;
-                    }
-                }
-            }
-
-            if count_at_doc < 2 {
-                // Not enough terms at this doc, skip it
-                start_from = min_doc + 1;
-                continue 'outer;
-            }
-
-            // Now check positions
-            self.compute_matched_terms_for(min_doc);
-            if self.matches_doc() {
-                return min_doc;
-            }
-
-            // Move to next candidate
-            start_from = min_doc + 1;
-        }
     }
 
     pub fn matched_term_count(&self) -> u32 {
         self.matched_term_count
     }
 
-    fn compute_matched_terms_for(&mut self, target_doc: DocId) {
-        if target_doc == TERMINATED {
+    /// Find next matching document using optimized union traversal.
+    /// Uses efficient seeking to minimize position computations.
+    fn find_next_matching_doc(&mut self) -> DocId {
+        if self.all_postings.is_empty() {
+            return TERMINATED;
+        }
+
+        loop {
+            // Find the minimum doc across ALL postings (union approach)
+            let mut candidate = TERMINATED;
+            for posting in &self.all_postings {
+                let doc = posting.doc();
+                if doc < candidate {
+                    candidate = doc;
+                }
+            }
+
+            if candidate == TERMINATED {
+                return TERMINATED;
+            }
+
+            // Quick check: count how many postings are at this candidate
+            let mut present_count = 0u32;
+            for posting in &self.all_postings {
+                if posting.doc() == candidate {
+                    present_count += 1;
+                    if present_count >= 2 {
+                        // Early exit optimization
+                        break;
+                    }
+                }
+            }
+
+            if present_count >= 2 {
+                // At least 2 terms present, check positions
+                self.current_doc = candidate;
+                self.compute_matched_terms();
+                if self.matches_doc() {
+                    return candidate;
+                }
+            }
+
+            // Advance all postings at candidate
+            for posting in &mut self.all_postings {
+                if posting.doc() == candidate {
+                    posting.advance();
+                }
+            }
+        }
+    }
+
+    fn compute_matched_terms(&mut self) {
+        if self.current_doc == TERMINATED {
             self.matched_term_count = 0;
             return;
         }
@@ -247,15 +247,9 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
             positions.clear();
         }
 
-        // Get positions from all postings for this doc
+        // Get positions from all postings at current doc
         for postings in &mut self.all_postings {
-            let doc = if postings.doc() < target_doc {
-                postings.seek(target_doc)
-            } else {
-                postings.doc()
-            };
-            
-            if doc == target_doc {
+            if postings.doc() == self.current_doc {
                 let orig_idx = postings.original_index();
                 postings.positions(&mut self.positions_per_term[orig_idx]);
             }
@@ -283,13 +277,31 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
 
 impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     fn advance(&mut self) -> DocId {
-        self.current_doc = self.find_next_matching_doc(self.current_doc + 1);
+        if self.all_postings.is_empty() {
+            return TERMINATED;
+        }
+        // Advance all postings at current_doc
+        for posting in &mut self.all_postings {
+            if posting.doc() == self.current_doc {
+                posting.advance();
+            }
+        }
+        self.current_doc = self.find_next_matching_doc();
         self.current_doc
     }
 
     fn seek(&mut self, target: DocId) -> DocId {
         debug_assert!(target >= self.doc());
-        self.current_doc = self.find_next_matching_doc(target);
+        if self.all_postings.is_empty() {
+            return TERMINATED;
+        }
+        // Seek all postings to target
+        for posting in &mut self.all_postings {
+            if posting.doc() < target {
+                posting.seek(target);
+            }
+        }
+        self.current_doc = self.find_next_matching_doc();
         self.current_doc
     }
 
@@ -310,12 +322,10 @@ impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     }
 
     fn size_hint(&self) -> u32 {
-        // Best estimate is the smallest posting list size
         self.all_postings.first().map(|p| p.size_hint()).unwrap_or(0)
     }
 
     fn cost(&self) -> u64 {
-        // Cost is driven by the smallest posting list
         self.all_postings.first().map(|p| p.cost()).unwrap_or(0)
     }
 }
