@@ -186,19 +186,28 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
     }
 
     /// Find next matching document using optimized union traversal.
-    /// Uses efficient seeking to minimize position computations.
+    /// Caches minimum doc index to avoid redundant scans - O(n) per candidate instead of O(2n).
     fn find_next_matching_doc(&mut self) -> DocId {
         if self.all_postings.is_empty() {
             return TERMINATED;
         }
 
         loop {
-            // Find the minimum doc across ALL postings (union approach)
+            // Find the minimum doc across ALL postings and count presences in single pass
             let mut candidate = TERMINATED;
-            for posting in &self.all_postings {
+            let mut present_count = 0u32;
+            let mut indices_at_candidate = Vec::with_capacity(self.num_terms);
+            
+            for (idx, posting) in self.all_postings.iter().enumerate() {
                 let doc = posting.doc();
                 if doc < candidate {
                     candidate = doc;
+                    present_count = 1;
+                    indices_at_candidate.clear();
+                    indices_at_candidate.push(idx);
+                } else if doc == candidate {
+                    present_count += 1;
+                    indices_at_candidate.push(idx);
                 }
             }
 
@@ -206,32 +215,22 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
                 return TERMINATED;
             }
 
-            // Quick check: count how many postings are at this candidate
-            let mut present_count = 0u32;
-            for posting in &self.all_postings {
-                if posting.doc() == candidate {
-                    present_count += 1;
-                    if present_count >= 2 {
-                        // Early exit optimization
-                        break;
-                    }
-                }
-            }
-
             if present_count >= 2 {
                 // At least 2 terms present, check positions
                 self.current_doc = candidate;
                 self.compute_matched_terms();
                 if self.matches_doc() {
+                    // Advance postings at candidate before returning
+                    for &idx in &indices_at_candidate {
+                        self.all_postings[idx].advance();
+                    }
                     return candidate;
                 }
             }
 
             // Advance all postings at candidate
-            for posting in &mut self.all_postings {
-                if posting.doc() == candidate {
-                    posting.advance();
-                }
+            for &idx in &indices_at_candidate {
+                self.all_postings[idx].advance();
             }
         }
     }
@@ -277,15 +276,7 @@ impl<TPostings: Postings> SparsePhraSeScorer<TPostings> {
 
 impl<TPostings: Postings> DocSet for SparsePhraSeScorer<TPostings> {
     fn advance(&mut self) -> DocId {
-        if self.all_postings.is_empty() {
-            return TERMINATED;
-        }
-        // Advance all postings at current_doc
-        for posting in &mut self.all_postings {
-            if posting.doc() == self.current_doc {
-                posting.advance();
-            }
-        }
+        // find_next_matching_doc already handles advancing
         self.current_doc = self.find_next_matching_doc();
         self.current_doc
     }
