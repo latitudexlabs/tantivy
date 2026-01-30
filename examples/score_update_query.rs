@@ -61,7 +61,7 @@ fn main() -> tantivy::Result<()> {
     // Wrap it with ScoreUpdateQuery to double all scores
     let doubled_query = ScoreUpdateQuery::new(
         Box::new(term_query.clone()),
-        Arc::new(|score| score * 2.0),
+        Some(Arc::new(|score| score * 2.0)),
     );
 
     let top_docs = searcher.search(&doubled_query, &TopDocs::with_limit(5).order_by_score())?;
