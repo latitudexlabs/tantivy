@@ -56,6 +56,7 @@ itertools = "0.14.0"
 measure_time = "0.9.0"
 arc-swap = "1.5.0"
 bon = "3.3.1"
+page_size = "0.6.0"
 
 columnar = { version = "0.6", path = "./columnar", package = "tantivy-columnar" }
 sstable = { version = "0.6", path = "./sstable", package = "tantivy-sstable", optional = true }
@@ -70,6 +71,9 @@ futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
 typetag = "0.2.21"
+bitflags = "2.8"
+ahash = "0.8"
+parking_lot = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 winapi = "0.3.9"
@@ -90,7 +94,8 @@ time = { version = "0.3.47", features = ["serde-well-known", "macros"] }
 postcard = { version = "1.0.4", features = [
     "use-std",
 ], default-features = false }
-
+tokio = { version = "1.40.0", features = ["full"] }
+anyhow = "1.0.86"
 [target.'cfg(not(windows))'.dev-dependencies]
 criterion = { version = "0.5", default-features = false }
 
@@ -113,7 +118,7 @@ debug-assertions = true
 overflow-checks = true
 
 [features]
-default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer"]
+default = ["mmap", "stopwords", "lz4-compression", "columnar-zstd-compression", "stemmer", "futures-util"]
 stemmer = ["rust-stemmers"]
 mmap = ["fs4", "tempfile", "memmap2"]
 stopwords = []
@@ -201,3 +206,12 @@ harness = false
 [[bench]]
 name = "regex_all_terms"
 harness = false
+
+[[bench]]
+name = "ngram_phrase_query"
+harness = false
+
+[[bench]]
+name = "fuzzy_phrase_query"
+harness = false
+

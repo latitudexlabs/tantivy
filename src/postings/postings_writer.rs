@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::io;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -7,6 +8,7 @@ use stacker::Addr;
 use crate::fieldnorm::FieldNormReaders;
 use crate::indexer::indexing_term::IndexingTerm;
 use crate::indexer::path_to_unordered_id::OrderedPathId;
+use crate::indexer::WordNgramConfig;
 use crate::postings::recorder::{BufferLender, Recorder};
 use crate::postings::{
     FieldSerializer, IndexingContext, InvertedIndexSerializer, PerFieldPostingsWriter,
@@ -165,10 +167,31 @@ pub(crate) trait PostingsWriter: Send + Sync {
 
 /// The `SpecializedPostingsWriter` is just here to remove dynamic
 /// dispatch to the recorder information.
-#[derive(Default)]
 pub(crate) struct SpecializedPostingsWriter<Rec: Recorder> {
     total_num_tokens: u64,
     _recorder_type: PhantomData<Rec>,
+    /// Sliding window of recent term texts for ngram generation
+    /// When edge_ngram is enabled, each element is a Vec of edge ngram variants for that token position
+    term_window: VecDeque<Vec<String>>,
+    /// Word ngram configuration if enabled
+    ngram_config: Option<WordNgramConfig>,
+    /// Reusable buffer for ngram construction (avoids repeated allocations)
+    ngram_buffer: String,
+    /// Set to track which ngrams have been emitted for the current field to avoid duplicates
+    seen_ngrams: HashSet<String>,
+}
+
+impl<Rec: Recorder> Default for SpecializedPostingsWriter<Rec> {
+    fn default() -> Self {
+        Self {
+            total_num_tokens: 0,
+            _recorder_type: PhantomData,
+            term_window: VecDeque::with_capacity(3),
+            ngram_config: None,
+            ngram_buffer: String::with_capacity(64),
+            seen_ngrams: HashSet::new(),
+        }
+    }
 }
 
 impl<Rec: Recorder> From<SpecializedPostingsWriter<Rec>> for Box<dyn PostingsWriter> {
@@ -180,6 +203,18 @@ impl<Rec: Recorder> From<SpecializedPostingsWriter<Rec>> for Box<dyn PostingsWri
 }
 
 impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
+    /// Create a new postings writer with optional ngram configuration
+    pub(crate) fn with_ngram_config(ngram_config: Option<WordNgramConfig>) -> Self {
+        Self {
+            total_num_tokens: 0,
+            _recorder_type: PhantomData,
+            term_window: VecDeque::with_capacity(3),
+            ngram_config,
+            ngram_buffer: String::with_capacity(64),
+            seen_ngrams: HashSet::new(),
+        }
+    }
+
     #[inline]
     pub(crate) fn serialize_one_term(
         term: &[u8],
@@ -225,6 +260,279 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
                 recorder
             }
         });
+    }
+
+    fn index_text(
+        &mut self,
+        doc_id: DocId,
+        token_stream: &mut dyn TokenStream,
+        term_buffer: &mut IndexingTerm,
+        ctx: &mut IndexingContext,
+        indexing_position: &mut IndexingPosition,
+    ) {
+        let end_of_path_idx = term_buffer.len_bytes();
+        let mut num_tokens = 0;
+        let mut end_position = indexing_position.end_position;
+
+        // Clear term window and seen ngrams at the start of each field value
+        self.term_window.clear();
+        self.seen_ngrams.clear();
+
+        // Extract config flags once outside the loop for better performance
+        let (
+            should_gen_bigrams,
+            should_gen_trigrams,
+            all_combinations,
+            combinations_window_size,
+            edge_ngram_enabled,
+            min_edge_ngram,
+        ) = if let Some(ref config) = self.ngram_config {
+            (
+                config.contains_bigrams(),
+                config.contains_trigrams(),
+                config.all_combinations,
+                config.all_combinations_window_size,
+                config.edge_ngram,
+                config.min_edge_ngram,
+            )
+        } else {
+            (false, false, false, 5, false, 2)
+        };
+
+        // Temporary buffer for edge ngrams to avoid repeated allocations
+        let mut edge_ngrams = Vec::with_capacity(10);
+
+        token_stream.process(&mut |token: &Token| {
+            // We skip all tokens with a len greater than u16.
+            if token.text.len() > MAX_TOKEN_LEN {
+                warn!(
+                    "A token exceeding MAX_TOKEN_LEN ({}>{}) was dropped. Search for \
+                     MAX_TOKEN_LEN in the documentation for more information.",
+                    token.text.len(),
+                    MAX_TOKEN_LEN
+                );
+                return;
+            }
+
+            // Index the original term
+            term_buffer.truncate_value_bytes(end_of_path_idx);
+            term_buffer.append_bytes(token.text.as_bytes());
+            let start_position = indexing_position.end_position + token.position as u32;
+            end_position = end_position.max(start_position + token.position_length as u32);
+            self.subscribe(doc_id, start_position, term_buffer, ctx);
+            num_tokens += 1;
+
+            // Generate ngrams if configured
+            // Note: We generate ALL ngrams for configured types (FF, FR, RF, etc.) without
+            // filtering by actual frequency during indexing. Frequency-based selection happens
+            // at query time when the FrequentTermTracker data is available.
+            if should_gen_bigrams || should_gen_trigrams {
+                // Generate edge ngrams if enabled
+                edge_ngrams.clear();
+                if edge_ngram_enabled {
+                    // Generate progressive prefixes from min_edge_ngram to full length
+                    let token_text = &token.text;
+                    
+                    // Always include the full token
+                    edge_ngrams.push(token_text.to_string());
+
+                    // Generate prefixes from full_len-1 down to min_edge_ngram
+                    // Optimize by collecting char indices once if needed
+                    let char_count = token_text.chars().count();
+                    if char_count > min_edge_ngram {
+                        // Build a char index map for efficient prefix extraction
+                        let char_indices: Vec<usize> = token_text.char_indices()
+                            .map(|(i, _)| i)
+                            .chain(std::iter::once(token_text.len()))
+                            .collect();
+                        
+                        for prefix_len in (min_edge_ngram..char_count).rev() {
+                            edge_ngrams.push(token_text[..char_indices[prefix_len]].to_string());
+                        }
+                    }
+                } else {
+                    // No edge ngrams, just use the full token
+                    edge_ngrams.push(token.text.to_string());
+                }
+
+                // Add edge ngrams as a group to the sliding window (move instead of clone)
+                // This ensures we don't generate combinations within the same token position
+                self.term_window.push_back(std::mem::take(&mut edge_ngrams));
+
+                // Keep window size limited based on mode
+                let max_window_size = if all_combinations {
+                    // Use configured window size for all_combinations mode
+                    combinations_window_size
+                } else {
+                    // In consecutive mode, only need last 3 tokens
+                    3
+                };
+
+                while self.term_window.len() > max_window_size {
+                    self.term_window.pop_front();
+                }
+
+                let window_len = self.term_window.len();
+
+                if all_combinations {
+                    // Generate ordered combinations that include the newest token position
+                    // This is much more efficient than regenerating all combinations
+                    // For a window of size N, we generate:
+                    // - Bigrams: N-1 pairs (new token position with each previous position)
+                    // - Trigrams: C(N-1,2) triplets (new token with each pair of previous positions)
+
+                    if window_len < 2 {
+                        // Nothing to do with less than 2 token positions
+                        return;
+                    }
+
+                    let last_idx = window_len - 1;
+                    // Clone only the last position's edge ngrams once
+                    let edges_last = self.term_window[last_idx].clone();
+
+                    // Generate bigrams: pair the new token position with each previous position
+                    // For each pair of positions, generate all combinations of their edge ngrams
+                    if should_gen_bigrams {
+                        for i in 0..last_idx {
+                            // Clone edge ngrams for position i once per outer loop iteration
+                            let edges_i = self.term_window[i].clone();
+
+                            // Generate all combinations of edge ngrams from position i and last position
+                            for edge_i in &edges_i {
+                                for edge_last in &edges_last {
+                                    // Skip bigrams where both words are identical
+                                    if edge_i == edge_last {
+                                        continue;
+                                    }
+
+                                    self.ngram_buffer.clear();
+                                    self.ngram_buffer.push_str(edge_i);
+                                    self.ngram_buffer.push(' ');
+                                    self.ngram_buffer.push_str(edge_last);
+
+                                    // Only index if we haven't seen this ngram for this field
+                                    if self.seen_ngrams.insert(self.ngram_buffer.clone()) {
+                                        term_buffer.truncate_value_bytes(end_of_path_idx);
+                                        term_buffer.append_bytes(self.ngram_buffer.as_bytes());
+                                        self.subscribe(doc_id, 0, term_buffer, ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Generate trigrams: combine the new token position with each pair of previous positions
+                    if should_gen_trigrams && window_len >= 3 {
+                        for i in 0..(last_idx - 1) {
+                            // Clone edge ngrams for position i once per outer loop
+                            let edges_i = self.term_window[i].clone();
+                            
+                            for j in (i + 1)..last_idx {
+                                // Clone edge ngrams for position j once per middle loop
+                                let edges_j = self.term_window[j].clone();
+
+                                // Generate all combinations of edge ngrams from positions i, j, and last
+                                for edge_i in &edges_i {
+                                    for edge_j in &edges_j {
+                                        for edge_last in &edges_last {
+                                            // Skip trigrams where all three words are identical
+                                            if edge_i == edge_j && edge_j == edge_last {
+                                                continue;
+                                            }
+
+                                            self.ngram_buffer.clear();
+                                            self.ngram_buffer.push_str(edge_i);
+                                            self.ngram_buffer.push(' ');
+                                            self.ngram_buffer.push_str(edge_j);
+                                            self.ngram_buffer.push(' ');
+                                            self.ngram_buffer.push_str(edge_last);
+
+                                            // Only index if we haven't seen this ngram for this field
+                                            if self.seen_ngrams.insert(self.ngram_buffer.clone()) {
+                                                term_buffer.truncate_value_bytes(end_of_path_idx);
+                                                term_buffer.append_bytes(self.ngram_buffer.as_bytes());
+                                                self.subscribe(doc_id, 0, term_buffer, ctx);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Generate only consecutive ngrams (original behavior)
+
+                    // Generate consecutive bigrams
+                    if should_gen_bigrams && window_len >= 2 {
+                        // Clone edge ngrams from last two positions once
+                        let edges_prev = self.term_window[window_len - 2].clone();
+                        let edges_curr = self.term_window[window_len - 1].clone();
+
+                        // Generate all combinations of edge ngrams from last two positions
+                        for edge_prev in &edges_prev {
+                            for edge_curr in &edges_curr {
+                                // Skip bigrams where both words are identical
+                                if edge_prev == edge_curr {
+                                    continue;
+                                }
+
+                                self.ngram_buffer.clear();
+                                self.ngram_buffer.push_str(edge_prev);
+                                self.ngram_buffer.push(' ');
+                                self.ngram_buffer.push_str(edge_curr);
+
+                                // Only index if we haven't seen this ngram for this field
+                                if self.seen_ngrams.insert(self.ngram_buffer.clone()) {
+                                    term_buffer.truncate_value_bytes(end_of_path_idx);
+                                    term_buffer.append_bytes(self.ngram_buffer.as_bytes());
+                                    // Ngrams use position 0 (they represent a phrase, not a single word position)
+                                    self.subscribe(doc_id, 0, term_buffer, ctx);
+                                }
+                            }
+                        }
+                    }
+
+                    // Generate consecutive trigrams (need at least 3 terms) - only if configured
+                    if should_gen_trigrams && window_len >= 3 {
+                        // Clone edge ngrams from last three positions once
+                        let edges_1 = self.term_window[window_len - 3].clone();
+                        let edges_2 = self.term_window[window_len - 2].clone();
+                        let edges_3 = self.term_window[window_len - 1].clone();
+
+                        // Generate all combinations of edge ngrams from last three positions
+                        for edge_1 in &edges_1 {
+                            for edge_2 in &edges_2 {
+                                for edge_3 in &edges_3 {
+                                    // Skip trigrams where all three words are identical
+                                    if edge_1 == edge_2 && edge_2 == edge_3 {
+                                        continue;
+                                    }
+
+                                    self.ngram_buffer.clear();
+                                    self.ngram_buffer.push_str(edge_1);
+                                    self.ngram_buffer.push(' ');
+                                    self.ngram_buffer.push_str(edge_2);
+                                    self.ngram_buffer.push(' ');
+                                    self.ngram_buffer.push_str(edge_3);
+
+                                    // Only index if we haven't seen this ngram for this field
+                                    if self.seen_ngrams.insert(self.ngram_buffer.clone()) {
+                                        term_buffer.truncate_value_bytes(end_of_path_idx);
+                                        term_buffer.append_bytes(self.ngram_buffer.as_bytes());
+                                        // Ngrams use position 0
+                                        self.subscribe(doc_id, 0, term_buffer, ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        indexing_position.end_position = end_position + POSITION_GAP;
+        indexing_position.num_tokens += num_tokens;
+        term_buffer.truncate_value_bytes(end_of_path_idx);
     }
 
     fn serialize(

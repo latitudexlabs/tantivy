@@ -2,6 +2,7 @@
 //! We use this variant only if the fastfield exists, otherwise the default in `range_query` is
 //! used, which uses the term dictionary + postings.
 
+use std::fmt::Debug;
 use std::net::Ipv6Addr;
 use std::ops::{Bound, RangeInclusive};
 
@@ -11,7 +12,7 @@ use columnar::{
 };
 use common::bounds::{BoundsRange, TransformBound};
 
-use super::fast_field_range_doc_set::RangeDocSet;
+use super::fast_field_range_doc_set::{FastFieldRangeScorer, RangeDocSet};
 use crate::query::{
     AllScorer, ConstScorer, EmptyScorer, EnableScoring, Explanation, Query, Scorer, Weight,
 };
@@ -22,19 +23,36 @@ use crate::{DocId, DocSet, Score, SegmentReader, TantivyError, Term};
 /// `FastFieldRangeQuery` is the same as [RangeQuery] but only uses the fast field
 pub struct FastFieldRangeQuery {
     bounds: BoundsRange<Term>,
+    scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+    base_scoring_value: Option<u64>,
+    base_scoring_value_sort_order: Option<u8>,
 }
 impl FastFieldRangeQuery {
     /// Create new `FastFieldRangeQuery`
-    pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> FastFieldRangeQuery {
+    pub fn new(
+        lower_bound: Bound<Term>,
+        upper_bound: Bound<Term>,
+        scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+        base_scoring_value: Option<u64>,
+        base_scoring_value_sort_order: Option<u8>,
+    ) -> FastFieldRangeQuery {
         Self {
             bounds: BoundsRange::new(lower_bound, upper_bound),
+            scoring_callback,
+            base_scoring_value,
+            base_scoring_value_sort_order,
         }
     }
 }
 
 impl Query for FastFieldRangeQuery {
     fn weight(&self, _enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
+        Ok(Box::new(FastFieldRangeWeight::new(
+            self.bounds.clone(),
+            self.scoring_callback,
+            self.base_scoring_value,
+            self.base_scoring_value_sort_order,
+        )))
     }
 }
 
@@ -42,12 +60,25 @@ impl Query for FastFieldRangeQuery {
 #[derive(Clone, Debug)]
 pub struct FastFieldRangeWeight {
     bounds: BoundsRange<Term>,
+    scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+    base_scoring_value: Option<u64>,
+    base_scoring_value_sort_order: Option<u8>,
 }
 
 impl FastFieldRangeWeight {
     /// Create a new FastFieldRangeWeight
-    pub fn new(bounds: BoundsRange<Term>) -> Self {
-        Self { bounds }
+    pub fn new(
+        bounds: BoundsRange<Term>,
+        scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+        base_scoring_value: Option<u64>,
+        base_scoring_value_sort_order: Option<u8>,
+    ) -> Self {
+        Self {
+            bounds,
+            scoring_callback,
+            base_scoring_value,
+            base_scoring_value_sort_order,
+        }
     }
 }
 
@@ -109,11 +140,25 @@ impl Weight for FastFieldRangeWeight {
                     else {
                         return Ok(Box::new(EmptyScorer));
                     };
-                    search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+                    search_on_u64_ff(
+                        column,
+                        boost,
+                        BoundsRange::new(lower_bound, upper_bound),
+                        self.scoring_callback,
+                        self.base_scoring_value,
+                        self.base_scoring_value_sort_order,
+                    )
                 }
-                Type::U64 | Type::I64 | Type::F64 => {
-                    search_on_json_numerical_field(reader, &field_name, typ, bounds, boost)
-                }
+                Type::U64 | Type::I64 | Type::F64 => search_on_json_numerical_field(
+                    reader,
+                    &field_name,
+                    typ,
+                    bounds,
+                    boost,
+                    self.scoring_callback,
+                    self.base_scoring_value,
+                    self.base_scoring_value_sort_order,
+                ),
                 Type::Date => {
                     let fast_field_reader = reader.fast_fields();
                     let Some((column, _col_type)) = fast_field_reader
@@ -126,6 +171,9 @@ impl Weight for FastFieldRangeWeight {
                         column,
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
+                        self.scoring_callback,
+                        self.base_scoring_value,
+                        self.base_scoring_value_sort_order,
                     )
                 }
                 Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
@@ -173,7 +221,14 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
-            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+            search_on_u64_ff(
+                column,
+                boost,
+                BoundsRange::new(lower_bound, upper_bound),
+                self.scoring_callback,
+                self.base_scoring_value,
+                self.base_scoring_value_sort_order,
+            )
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
                 reader.fast_fields().bytes(&field_name)?
@@ -192,7 +247,14 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
-            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound))
+            search_on_u64_ff(
+                column,
+                boost,
+                BoundsRange::new(lower_bound, upper_bound),
+                self.scoring_callback,
+                self.base_scoring_value,
+                self.base_scoring_value_sort_order,
+            )
         } else {
             assert!(
                 maps_to_u64_fastfield(field_type.value_type()),
@@ -234,6 +296,9 @@ impl Weight for FastFieldRangeWeight {
                 column,
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
+                self.scoring_callback,
+                self.base_scoring_value,
+                self.base_scoring_value_sort_order,
             )
         }
     }
@@ -260,6 +325,9 @@ fn search_on_json_numerical_field(
     typ: Type,
     bounds: BoundsRange<ValueBytes<Vec<u8>>>,
     boost: Score,
+    scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+    base_scoring_value: Option<u64>,
+    base_scoring_value_sort_order: Option<u8>,
 ) -> crate::Result<Box<dyn Scorer>> {
     // Since we don't know which type was interpolated for the internal column we
     // have to check for all numeric types (only one exists)
@@ -337,6 +405,9 @@ fn search_on_json_numerical_field(
         column,
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
+        scoring_callback,
+        base_scoring_value,
+        base_scoring_value_sort_order,
     )
 }
 
@@ -415,6 +486,9 @@ fn search_on_u64_ff(
     column: Column<u64>,
     boost: Score,
     bounds: BoundsRange<u64>,
+    scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
+    base_scoring_value: Option<u64>,
+    base_scoring_value_sort_order: Option<u8>,
 ) -> crate::Result<Box<dyn Scorer>> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
@@ -446,7 +520,13 @@ fn search_on_u64_ff(
     }
 
     let docset = RangeDocSet::new(value_range, column);
-    Ok(Box::new(ConstScorer::new(docset, boost)))
+    Ok(Box::new(FastFieldRangeScorer::new(
+        docset,
+        boost,
+        scoring_callback,
+        base_scoring_value,
+        base_scoring_value_sort_order,
+    )))
 }
 
 /// Returns true if the type maps to a u64 fast field
@@ -662,6 +742,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(Term::from_field_date(date_field, dt3)),
                 Bound::Excluded(Term::from_field_date(date_field, dt4)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -669,6 +752,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(Term::from_field_date(date_field, dt3)),
                 Bound::Included(Term::from_field_date(date_field, dt4)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -676,6 +762,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(Term::from_field_date(date_field, dt1)),
                 Bound::Included(Term::from_field_date(date_field, dt2)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -683,6 +772,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(Term::from_field_date(date_field, dt1)),
                 Bound::Excluded(Term::from_field_date(date_field, dt2)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -690,6 +782,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Excluded(Term::from_field_date(date_field, dt1)),
                 Bound::Excluded(Term::from_field_date(date_field, dt2)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -746,6 +841,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(&schema, "id_u64", 10u64)),
                 Bound::Included(get_json_term(&schema, "id_u64", 10u64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -753,6 +851,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(&schema, "id_u64", 9u64)),
                 Bound::Excluded(get_json_term(&schema, "id_u64", 10u64)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -762,6 +863,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(&schema, "id_i64", 50i64)),
                 Bound::Included(get_json_term(&schema, "id_i64", 1000i64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -769,6 +873,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(&schema, "id_i64", 50i64)),
                 Bound::Excluded(get_json_term(&schema, "id_i64", 1000i64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -809,6 +916,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "mixed_val", 10000u64)),
                 Bound::Included(get_json_term(json_field, "mixed_val", 20000u64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -821,6 +931,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term_str(json_field, "mixed_val", "1000a")),
                 Bound::Included(get_json_term_str(json_field, "mixed_val", "2000b")),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -828,6 +941,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term_str(json_field, "mixed_val", "1000")),
                 Bound::Included(get_json_term_str(json_field, "mixed_val", "2000a")),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -874,6 +990,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_u64", u64_val)),
                 Bound::Included(get_json_term(json_field, "id_u64", u64_val)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -881,6 +1000,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_u64", u64_val)),
                 Bound::Excluded(get_json_term(json_field, "id_u64", u64_val)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -894,6 +1016,9 @@ mod tests {
                     (u64_val - 10000) as f64
                 )),
                 Bound::Included(get_json_term(json_field, "id_u64", (u64_val) as f64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -902,6 +1027,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_u64", 0_i64)),
                 Bound::Included(get_json_term(json_field, "id_u64", 0_i64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -909,6 +1037,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_u64", 1_i64)),
                 Bound::Included(get_json_term(json_field, "id_u64", 1_i64)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -917,6 +1048,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_f64", 10_u64)),
                 Bound::Included(get_json_term(json_field, "id_f64", 11_u64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -924,6 +1058,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_f64", 10_u64)),
                 Bound::Included(get_json_term(json_field, "id_f64", 2000_u64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -932,6 +1069,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_f64", 10_i64)),
                 Bound::Included(get_json_term(json_field, "id_f64", 2000_i64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -941,6 +1081,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000i64)),
                 Bound::Included(get_json_term(json_field, "id_i64", 1000i64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -948,6 +1091,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", 1000i64)),
                 Bound::Excluded(get_json_term(json_field, "id_i64", 1001i64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -957,6 +1103,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", 0_u64)),
                 Bound::Included(get_json_term(json_field, "id_i64", 1000u64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -964,6 +1113,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", 0_u64)),
                 Bound::Included(get_json_term(json_field, "id_i64", 999u64)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -972,6 +1124,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000.0)),
                 Bound::Included(get_json_term(json_field, "id_i64", 1000.0)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -979,6 +1134,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000.0f64)),
                 Bound::Excluded(get_json_term(json_field, "id_i64", 1000.0f64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -986,6 +1144,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000.0f64)),
                 Bound::Included(get_json_term(json_field, "id_i64", 1000.0f64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -993,6 +1154,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000.0f64)),
                 Bound::Excluded(get_json_term(json_field, "id_i64", 1000.01f64)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -1000,6 +1164,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "id_i64", -1000.0f64)),
                 Bound::Included(get_json_term(json_field, "id_i64", 999.99f64)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -1007,6 +1174,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Excluded(get_json_term(json_field, "id_i64", 999.9)),
                 Bound::Excluded(get_json_term(json_field, "id_i64", 1000.1)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -1049,6 +1219,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "date", dt1)),
                 Bound::Included(get_json_term(json_field, "date", dt2)),
+                None,
+                None,
+                None,
             )),
             2
         );
@@ -1056,6 +1229,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Included(get_json_term(json_field, "date", dt1)),
                 Bound::Excluded(get_json_term(json_field, "date", dt2)),
+                None,
+                None,
+                None,
             )),
             1
         );
@@ -1063,6 +1239,9 @@ mod tests {
             count(RangeQuery::new(
                 Bound::Excluded(get_json_term(json_field, "date", dt1)),
                 Bound::Excluded(get_json_term(json_field, "date", dt2)),
+                None,
+                None,
+                None,
             )),
             0
         );
@@ -1076,6 +1255,9 @@ mod tests {
         let query = RangeQuery::new(
             Bound::Included(get_json_term(json_field, "date", dt3)),
             Bound::Excluded(get_json_term(json_field, "date", dt4)),
+            None,
+            None,
+            None,
         );
         assert_eq!(count(query), 1);
     }
@@ -1156,10 +1338,15 @@ mod tests {
         writer.add_document(doc!(field=>52_000u64)).unwrap();
         writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
-        let range_query = FastFieldRangeWeight::new(BoundsRange::new(
-            Bound::Included(Term::from_field_u64(field, 50_000)),
-            Bound::Included(Term::from_field_u64(field, 50_002)),
-        ));
+        let range_query = FastFieldRangeWeight::new(
+            BoundsRange::new(
+                Bound::Included(Term::from_field_u64(field, 50_000)),
+                Bound::Included(Term::from_field_u64(field, 50_002)),
+            ),
+            None,
+            None,
+            None,
+        );
         let scorer = range_query
             .scorer(searcher.segment_reader(0), 1.0f32)
             .unwrap();
@@ -1458,7 +1645,7 @@ mod tests {
         // Should match: [0x00, 0x20], [0x00, 0x30], [0x01, 0x00]
         let lower = Term::from_field_bytes(bytes_field, &[0x00, 0x20]);
         let upper = Term::from_field_bytes(bytes_field, &[0x01, 0x00]);
-        let range_query = RangeQuery::new(Bound::Included(lower), Bound::Included(upper));
+        let range_query = RangeQuery::new(Bound::Included(lower), Bound::Included(upper), None, None, None);
         let count = searcher.search(&range_query, &Count)?;
         assert_eq!(
             count, 3,
@@ -1468,14 +1655,14 @@ mod tests {
         // Test: Range query > [0x01, 0x00] (exclusive lower bound)
         // Should match: [0x01, 0x10], [0x02, 0x00]
         let lower = Term::from_field_bytes(bytes_field, &[0x01, 0x00]);
-        let range_query = RangeQuery::new(Bound::Excluded(lower), Bound::Unbounded);
+        let range_query = RangeQuery::new(Bound::Excluded(lower), Bound::Unbounded, None, None, None);
         let count = searcher.search(&range_query, &Count)?;
         assert_eq!(count, 2, "Expected 2 documents > [0x01,0x00]");
 
         // Test: Range query < [0x00, 0x30] (exclusive upper bound)
         // Should match: [0x00, 0x10], [0x00, 0x20]
         let upper = Term::from_field_bytes(bytes_field, &[0x00, 0x30]);
-        let range_query = RangeQuery::new(Bound::Unbounded, Bound::Excluded(upper));
+        let range_query = RangeQuery::new(Bound::Unbounded, Bound::Excluded(upper), None, None, None);
         let count = searcher.search(&range_query, &Count)?;
         assert_eq!(count, 2, "Expected 2 documents < [0x00,0x30]");
 
@@ -1575,10 +1762,15 @@ pub(crate) mod ip_range_tests {
         }
         writer.commit().unwrap();
         let searcher = index.reader().unwrap().searcher();
-        let range_weight = FastFieldRangeWeight::new(BoundsRange::new(
-            Bound::Included(Term::from_field_ip_addr(ips_field, ip_addrs[1])),
-            Bound::Included(Term::from_field_ip_addr(ips_field, ip_addrs[2])),
-        ));
+        let range_weight = FastFieldRangeWeight::new(
+            BoundsRange::new(
+                Bound::Included(Term::from_field_ip_addr(ips_field, ip_addrs[1])),
+                Bound::Included(Term::from_field_ip_addr(ips_field, ip_addrs[2])),
+            ),
+            None,
+            None,
+            None,
+        );
 
         let count =
             crate::query::weight::Weight::count(&range_weight, searcher.segment_reader(0)).unwrap();

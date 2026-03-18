@@ -279,6 +279,60 @@ impl InvertedIndexReader {
             .map(|term_info| term_info.doc_freq)
             .unwrap_or(0u32))
     }
+
+    fn warmup_bytes(bytes: &[u8]) {
+        let page_size = page_size::get();
+        for i in (0..bytes.len()).step_by(page_size) {
+            unsafe {
+                std::ptr::read_volatile(&bytes[i]);
+            }
+        }
+    }
+
+    /// Warmup the block postings for all terms.
+    /// This method is for an advanced usage only.
+    ///
+    /// If you know which terms to pre-load, prefer using [`Self::warm_postings`] or
+    /// [`Self::warm_postings`] instead.
+    #[cfg(not(feature = "quickwit"))]
+    pub async fn warm_postings_full(&self, with_positions: bool, with_ospage: bool) -> io::Result<()> {
+        let data = self.postings_file_slice.read_bytes_async().await?;
+        if with_ospage {
+            Self::warmup_bytes(&data);
+        }
+        if with_positions {
+            let data = self.positions_file_slice.read_bytes_async().await?;
+            if with_ospage {
+                Self::warmup_bytes(&data);
+            }
+        }
+        Ok(())
+    }
+
+    /// Warmup a block postings given a `Term`.
+    /// This method is for an advanced usage only.
+    ///
+    /// returns a boolean, whether the term was found in the dictionary
+    #[cfg(not(feature = "quickwit"))]
+    pub async fn warm_postings(&self, term: &Term, with_positions: bool) -> io::Result<bool> {
+        let term_info_opt: Option<TermInfo> = self.get_term_info(term)?;
+        if let Some(term_info) = term_info_opt {
+            let postings = self
+                .postings_file_slice
+                .read_bytes_slice_async(term_info.postings_range.clone());
+            if with_positions {
+                let positions = self
+                    .positions_file_slice
+                    .read_bytes_slice_async(term_info.positions_range.clone());
+                futures_util::future::try_join(postings, positions).await?;
+            } else {
+                postings.await?;
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
 }
 
 #[cfg(feature = "quickwit")]

@@ -1,7 +1,9 @@
 use super::PhraseWeight;
 use crate::query::bm25::Bm25Weight;
+use crate::query::ngram_query_optimizer::NgramQueryOptimizer;
 use crate::query::{EnableScoring, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
+use std::sync::Arc;
 
 /// `PhraseQuery` matches a specific sequence of words.
 ///
@@ -51,6 +53,24 @@ impl PhraseQuery {
             "A phrase query is required to have strictly more than one term."
         );
         terms.sort_by_key(|&(offset, _)| offset);
+        let field = terms[0].1.field();
+        assert!(
+            terms[1..].iter().all(|term| term.1.field() == field),
+            "All terms from a phrase query must belong to the same field"
+        );
+        PhraseQuery {
+            field,
+            phrase_terms: terms,
+            slop,
+        }
+    }
+
+    /// Creates a new `PhraseQuery` given a list of terms, their offsets and a slop
+    pub fn new_with_offset_and_slop_nosort(terms: Vec<(usize, Term)>, slop: u32) -> PhraseQuery {
+        assert!(
+            terms.len() > 1,
+            "A phrase query is required to have strictly more than one term."
+        );
         let field = terms[0].1.field();
         assert!(
             terms[1..].iter().all(|term| term.1.field() == field),
@@ -137,6 +157,21 @@ impl Query for PhraseQuery {
     ///
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        // Try ngram optimization first
+        let schema = enable_scoring.schema();
+        let optimizer = NgramQueryOptimizer::new(Arc::new(schema.clone()));
+        
+        if let Some(optimized_query) = optimizer.optimize_phrase_query(
+            self.field,
+            &self.phrase_terms,
+            self.slop,
+            enable_scoring.searcher(),
+        ) {
+            // Use the optimized query (ngram-based)
+            return optimized_query.weight(enable_scoring);
+        }
+        
+        // Fall back to regular phrase query
         let phrase_weight = self.phrase_weight(enable_scoring)?;
         Ok(Box::new(phrase_weight))
     }

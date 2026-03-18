@@ -11,9 +11,11 @@ mod empty_query;
 mod exclude;
 mod exist_query;
 mod explanation;
+mod fuzzy_phrase_query;
 mod fuzzy_query;
 mod intersection;
 mod more_like_this;
+mod ngram_query_optimizer;
 mod phrase_prefix_query;
 mod phrase_query;
 mod query;
@@ -21,6 +23,7 @@ mod query_parser;
 mod range_query;
 mod regex_query;
 mod reqopt_scorer;
+mod score_update_query;
 mod scorer;
 mod set_query;
 mod size_hint;
@@ -46,11 +49,13 @@ pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};
 pub use self::exclude::{Exclude, ExclusionSet};
 pub use self::exist_query::ExistsQuery;
 pub use self::explanation::Explanation;
+pub use self::fuzzy_phrase_query::FuzzyPhraseQuery;
 #[cfg(test)]
 pub(crate) use self::fuzzy_query::DfaWrapper;
 pub use self::fuzzy_query::FuzzyTermQuery;
 pub use self::intersection::{intersect_scorers, Intersection};
 pub use self::more_like_this::{MoreLikeThisQuery, MoreLikeThisQueryBuilder};
+pub use self::ngram_query_optimizer::NgramQueryOptimizer;
 pub use self::phrase_prefix_query::PhrasePrefixQuery;
 pub use self::phrase_query::regex_phrase_query::{wildcard_query_to_regex_str, RegexPhraseQuery};
 pub use self::phrase_query::PhraseQuery;
@@ -59,11 +64,18 @@ pub use self::query_parser::{QueryParser, QueryParserError};
 pub use self::range_query::*;
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
-pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner};
+pub use self::score_combiner::{DisjunctionMaxCombiner, ScoreCombiner, SumCombiner, DoNothingCombiner};
+pub use self::score_update_query::{
+    ScoreUpdateQuery, ScoreUpdateWeight, ScoreUpdateScorer, ScoreUpdateFn,
+    ScoreUpdateQueryWithContext, ScoreUpdateWeightWithContext, ScoreUpdateScorerWithContext,
+    ScoreUpdateWithContextFn, ScoringContext,
+};
 pub use self::scorer::Scorer;
 pub use self::set_query::TermSetQuery;
 pub use self::term_query::TermQuery;
+pub use self::term_query::TermFilterQuery;
 pub use self::union::BufferedUnionScorer;
+pub use self::set_query::SetDfaWrapper;
 #[cfg(test)]
 pub use self::vec_docset::VecDocSet;
 pub use self::weight::Weight;

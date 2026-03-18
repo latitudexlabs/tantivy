@@ -139,6 +139,9 @@ impl Query for TermQuery {
             let range_query = RangeQuery::new(
                 Bound::Included(self.term.clone()),
                 Bound::Included(self.term.clone()),
+                None,
+                None,
+                None
             );
             return range_query.weight(enable_scoring);
         }
