@@ -511,14 +511,14 @@ mod tests {
 
     fn datetime_from_iso_str(date_str: &str) -> common::DateTime {
         let dt = OffsetDateTime::parse(date_str, &Rfc3339)
-            .expect(&format!("Failed to parse date: {}", date_str));
+            .unwrap_or_else(|_| panic!("Failed to parse date: {}", date_str));
         let timestamp_secs = dt.unix_timestamp_nanos();
         common::DateTime::from_timestamp_nanos(timestamp_secs as i64)
     }
 
     fn ms_timestamp_from_iso_str(date_str: &str) -> i64 {
         let dt = OffsetDateTime::parse(date_str, &Rfc3339)
-            .expect(&format!("Failed to parse date: {}", date_str));
+            .unwrap_or_else(|_| panic!("Failed to parse date: {}", date_str));
         (dt.unix_timestamp_nanos() / 1_000_000) as i64
     }
 
@@ -533,7 +533,7 @@ mod tests {
         let expected_buckets_vec = expected_buckets.as_array().unwrap();
 
         for page_size in 1..=expected_buckets_vec.len() {
-            let page_count = (expected_buckets_vec.len() + page_size - 1) / page_size;
+            let page_count = expected_buckets_vec.len().div_ceil(page_size);
             let mut after_key = None;
             for page_idx in 0..page_count {
                 let mut agg_req_json = json!({
@@ -548,7 +548,7 @@ mod tests {
                     agg_req_json["my_composite"]["composite"]["after"] = after_key.take().unwrap();
                 }
                 let agg_req: Aggregations = serde_json::from_value(agg_req_json).unwrap();
-                let res = exec_request(agg_req.clone(), &index).unwrap();
+                let res = exec_request(agg_req.clone(), index).unwrap();
                 let expected_page_buckets = &expected_buckets_vec[page_idx * page_size
                     ..std::cmp::min((page_idx + 1) * page_size, expected_buckets_vec.len())];
                 assert_eq!(
@@ -565,7 +565,7 @@ mod tests {
                         "expected after_key on all but last page"
                     );
                     after_key = Some(res["my_composite"]["after_key"].clone());
-                } else if let Some(_) = res["my_composite"].get("after_key") {
+                } else if res["my_composite"].get("after_key").is_some() {
                     // currently we sometime have an after_key on the last page,
                     // check that the next "page" is empty
                     let agg_req_json = json!({
@@ -578,7 +578,7 @@ mod tests {
                         }
                     });
                     let agg_req: Aggregations = serde_json::from_value(agg_req_json).unwrap();
-                    let res = exec_request(agg_req.clone(), &index).unwrap();
+                    let res = exec_request(agg_req.clone(), index).unwrap();
                     assert_eq!(
                         res["my_composite"]["buckets"],
                         json!([]),
