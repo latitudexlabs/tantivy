@@ -98,7 +98,7 @@ impl SegmentAggregationCollector for TermMissingAgg {
 
         let missing_count = &self.missing_count_per_bucket[parent_bucket_id as usize];
         let mut missing_entry = IntermediateTermBucketEntry {
-            doc_count: missing_count.missing_count,
+            doc_count: missing_count.missing_count as u64,
             sub_aggregation: Default::default(),
         };
         if let Some(sub_agg) = &mut self.sub_agg {
@@ -176,6 +176,17 @@ impl SegmentAggregationCollector for TermMissingAgg {
             sub_agg.flush(agg_data)?;
         }
         Ok(())
+    }
+
+    fn compute_metric_value(
+        &self,
+        _bucket_id: BucketId,
+        _sub_agg_name: &str,
+        _sub_agg_property: &str,
+        _agg_data: &AggregationsSegmentCtx,
+    ) -> Option<f64> {
+        // TODO: forward to `sub_agg` for nested order paths (`missing_agg>metric`).
+        None
     }
 }
 

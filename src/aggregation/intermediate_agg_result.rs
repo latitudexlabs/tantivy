@@ -377,7 +377,22 @@ impl IntermediateMetricResult {
                 MetricResult::ExtendedStats(intermediate_stats.finalize())
             }
             IntermediateMetricResult::Sum(intermediate_sum) => {
-                MetricResult::Sum(intermediate_sum.finalize().into())
+                // By default match Elasticsearch: empty / all-missing sum
+                // buckets serialize as `"value": 0`, not `"value": null`.
+                // The non-ES `none_if_no_match` flag on `SumAggregation`
+                // opts into SQL-style `null` for downstream consumers.
+                let none_if_no_match = req
+                    .agg
+                    .as_sum()
+                    .and_then(|sum| sum.none_if_no_match)
+                    .unwrap_or(false);
+                let value = intermediate_sum.finalize();
+                if none_if_no_match {
+                    MetricResult::Sum(value.into())
+                } else {
+                    let value = Some(value.unwrap_or(0.0));
+                    MetricResult::Sum(value.into())
+                }
             }
             IntermediateMetricResult::Percentiles(percentiles) => MetricResult::Percentiles(
                 percentiles
@@ -723,7 +738,7 @@ impl IntermediateTermBucketResult {
         let mut buckets: Vec<BucketEntry> = self
             .entries
             .into_iter()
-            .filter(|bucket| bucket.1.doc_count as u64 >= req.min_doc_count)
+            .filter(|bucket| bucket.1.doc_count >= req.min_doc_count)
             .map(|(key, entry)| {
                 let key_as_string = match key {
                     IntermediateKey::Bool(key) => {
@@ -735,7 +750,7 @@ impl IntermediateTermBucketResult {
                 Ok(BucketEntry {
                     key_as_string,
                     key: key.into(),
-                    doc_count: entry.doc_count as u64,
+                    doc_count: entry.doc_count,
                     sub_aggregation: entry
                         .sub_aggregation
                         .into_final_result_internal(sub_aggregation_req, limits)?,
@@ -792,7 +807,7 @@ impl IntermediateTermBucketResult {
         // This can be interesting, as a value of quality of the results, but not good to check the
         // actual error count for the returned terms.
         let (_term_doc_count_before_cutoff, sum_other_doc_count) =
-            cut_off_buckets(&mut buckets, req.size as usize);
+            cut_off_buckets(&mut buckets, req.size as usize, None);
 
         let doc_count_error_upper_bound = if req.show_term_doc_count_error {
             Some(self.doc_count_error_upper_bound)
@@ -915,7 +930,7 @@ impl IntermediateRangeBucketEntry {
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntermediateTermBucketEntry {
     /// The number of documents in the bucket.
-    pub doc_count: u32,
+    pub doc_count: u64,
     /// The sub_aggregation in this bucket.
     pub sub_aggregation: IntermediateAggregationResults,
 }
@@ -1004,24 +1019,20 @@ impl IntermediateCompositeBucketResult {
     ) -> crate::Result<BucketResult> {
         let trimmed_entry_vec =
             trim_composite_buckets(self.entries, &self.orders, self.target_size)?;
-        let after_key = if trimmed_entry_vec.len() == req.size as usize {
-            trimmed_entry_vec
-                .last()
-                .map(|bucket| {
-                    let (intermediate_key, _entry) = bucket;
-                    intermediate_key
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, intermediate_key)| {
-                            let source = &req.sources[idx];
-                            (source.name().to_string(), intermediate_key.clone().into())
-                        })
-                        .collect()
-                })
-                .unwrap()
-        } else {
-            FxHashMap::default()
-        };
+        let after_key = trimmed_entry_vec
+            .last()
+            .map(|bucket| {
+                let (intermediate_key, _entry) = bucket;
+                intermediate_key
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, intermediate_key)| {
+                        let source = &req.sources[idx];
+                        (source.name().to_string(), intermediate_key.clone().into())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let buckets = trimmed_entry_vec
             .into_iter()
@@ -1036,7 +1047,7 @@ impl IntermediateCompositeBucketResult {
                     .collect();
                 Ok(CompositeBucketEntry {
                     key,
-                    doc_count: entry.doc_count as u64,
+                    doc_count: entry.doc_count,
                     sub_aggregation: entry
                         .sub_aggregation
                         .into_final_result_internal(sub_aggregation_req, limits)?,
@@ -1227,6 +1238,24 @@ mod tests {
         ]);
 
         assert_eq!(tree_left, tree_expected);
+    }
+
+    #[test]
+    fn test_term_bucket_doc_count_no_u32_overflow() {
+        // Two segments each contributing (u32::MAX - 100) docs to the same term. Summing them
+        // overflowed when doc_count was u32.
+        let per_segment = u32::MAX as u64 - 100;
+        let mut entry = IntermediateTermBucketEntry {
+            doc_count: per_segment,
+            sub_aggregation: Default::default(),
+        };
+        entry
+            .merge_fruits(IntermediateTermBucketEntry {
+                doc_count: per_segment,
+                sub_aggregation: Default::default(),
+            })
+            .unwrap();
+        assert_eq!(entry.doc_count, per_segment * 2);
     }
 
     #[test]

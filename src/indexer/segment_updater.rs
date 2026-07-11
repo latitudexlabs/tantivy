@@ -41,10 +41,7 @@ pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate:
     // Just adding a new line at the end of the buffer.
     writeln!(&mut buffer)?;
     crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            msg.unwrap_or_else(|| "Undefined".to_string())
-        )
+        std::io::Error::other(msg.unwrap_or_else(|| "Undefined".to_string()))
     )));
     directory.sync_directory()?;
     directory.atomic_write(&META_FILEPATH, &buffer[..])?;
@@ -114,10 +111,11 @@ fn merge(
         .collect();
 
     // An IndexMerger is like a "view" of our merged segments.
-    let merger: IndexMerger = IndexMerger::open(index.schema(), &segments[..])?;
+    let merger: IndexMerger =
+        IndexMerger::open(index.schema(), index.settings().clone(), &segments[..])?;
 
     // ... we just serialize this index merger in our new segment to merge the segments.
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone())?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment.clone(), true)?;
 
     let num_docs = merger.write(segment_serializer)?;
 
@@ -218,9 +216,13 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
     )?;
     let merged_segment = merged_index.new_segment();
     let merged_segment_id = merged_segment.id();
-    let merger: IndexMerger =
-        IndexMerger::open_with_custom_alive_set(merged_index.schema(), segments, filter_doc_ids)?;
-    let segment_serializer = SegmentSerializer::for_segment(merged_segment)?;
+    let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
+        merged_index.schema(),
+        merged_index.settings().clone(),
+        segments,
+        filter_doc_ids,
+    )?;
+    let segment_serializer = SegmentSerializer::for_segment(merged_segment, true)?;
     let num_docs = merger.write(segment_serializer)?;
 
     let segment_meta = merged_index.new_segment_meta(merged_segment_id, num_docs);
@@ -1115,6 +1117,7 @@ mod tests {
             )?;
             let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
             )?;
@@ -1130,6 +1133,7 @@ mod tests {
                 Index::create(RamDirectory::default(), target_schema, target_settings)?;
             let merger: IndexMerger = IndexMerger::open_with_custom_alive_set(
                 merged_index.schema(),
+                merged_index.settings().clone(),
                 &segments[..],
                 filter_segments,
             )?;

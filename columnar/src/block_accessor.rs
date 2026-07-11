@@ -15,9 +15,37 @@ impl<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static + Default>
 {
     #[inline]
     pub fn fetch_block<'a>(&'a mut self, docs: &'a [u32], accessor: &Column<T>) {
-        if accessor.index.get_cardinality().is_full() {
-            self.val_cache.resize(docs.len(), T::default());
-            accessor.values.get_vals(docs, &mut self.val_cache);
+        self.fetch_block_with_is_full(docs, accessor, accessor.index.get_cardinality().is_full());
+    }
+
+    /// Like [`Self::fetch_block`] but takes the column's fullness instead of querying
+    /// `accessor.index.get_cardinality()` each call — for callers that know it up front (e.g.
+    /// checked once at construction). `is_full` must equal
+    /// `accessor.index.get_cardinality().is_full()`.
+    #[inline]
+    pub fn fetch_block_with_is_full<'a>(
+        &'a mut self,
+        docs: &'a [u32],
+        accessor: &Column<T>,
+        is_full: bool,
+    ) {
+        if is_full {
+            // Skip the resize when already the right length (common case: fixed-size blocks).
+            if self.val_cache.len() != docs.len() {
+                self.val_cache.resize(docs.len(), T::default());
+            }
+            // When the docs form a contiguous ascending run we can fetch the values
+            // as a single range. This lets codecs (e.g. bitpacked) bulk-decode the
+            // slice instead of gathering value-by-value, and avoids per-value dynamic
+            // dispatch. `docs` is always sorted ascending and free of duplicates here,
+            // so comparing the endpoints is enough to detect contiguity.
+            if is_contiguous(docs) {
+                accessor
+                    .values
+                    .get_range(docs[0] as u64, &mut self.val_cache);
+            } else {
+                accessor.values.get_vals(docs, &mut self.val_cache);
+            }
         } else {
             self.docid_cache.clear();
             self.row_id_cache.clear();
@@ -158,6 +186,22 @@ impl<T: PartialOrd + Copy + std::fmt::Debug + Send + Sync + 'static + Default>
     }
 }
 
+/// Returns true if `docs` is a contiguous ascending run `[d, d + 1, ..., d + n - 1]`.
+///
+/// Assumes `docs` is sorted ascending and free of duplicates (the invariant for the
+/// doc blocks passed to `fetch_block`), so comparing the endpoints is sufficient.
+#[inline]
+fn is_contiguous(docs: &[u32]) -> bool {
+    let (Some(&first), Some(&last)) = (docs.first(), docs.last()) else {
+        return false;
+    };
+    debug_assert!(
+        docs.windows(2).all(|w| w[0] < w[1]),
+        "fetch_block requires docs sorted ascending without duplicates"
+    );
+    (last - first) as usize + 1 == docs.len()
+}
+
 /// Given two sorted lists of docids `docs` and `hits`, hits is a subset of `docs`.
 /// Return all docs that are not in `hits`.
 fn find_missing_docs<F>(docs: &[u32], hits: &[u32], mut callback: F)
@@ -287,5 +331,47 @@ mod tests {
         accessor.dedup_docid_val_pairs();
         assert_eq!(accessor.docid_cache, vec![0]);
         assert_eq!(accessor.val_cache, vec![1]);
+    }
+
+    #[test]
+    fn test_is_contiguous() {
+        assert!(!is_contiguous(&[]));
+        assert!(is_contiguous(&[5]));
+        assert!(is_contiguous(&[5, 6, 7, 8]));
+        assert!(is_contiguous(&[0, 1, 2]));
+        assert!(!is_contiguous(&[5, 7, 8]));
+        assert!(!is_contiguous(&[0, 1, 3]));
+    }
+
+    #[test]
+    fn test_fetch_block_contiguous_and_gather_match() {
+        use crate::column_index::ColumnIndex;
+        use crate::column_values::{
+            ALL_U64_CODEC_TYPES, serialize_and_load_u64_based_column_values,
+        };
+
+        let vals: Vec<u64> = (0..200u64).map(|i| i * 7 + 3).collect();
+        let values =
+            serialize_and_load_u64_based_column_values::<u64>(&&vals[..], &ALL_U64_CODEC_TYPES);
+        let column = Column {
+            index: ColumnIndex::Full,
+            values,
+        };
+
+        let check = |accessor: &mut ColumnBlockAccessor<u64>, docs: &[u32]| {
+            accessor.fetch_block(docs, &column);
+            let got: Vec<(u32, u64)> = accessor.iter_docid_vals(docs, &column).collect();
+            let expected: Vec<(u32, u64)> = docs.iter().map(|&d| (d, vals[d as usize])).collect();
+            assert_eq!(got, expected);
+        };
+
+        let mut accessor = ColumnBlockAccessor::<u64>::default();
+        // Contiguous block -> get_range fast path.
+        check(&mut accessor, &(10..74).collect::<Vec<u32>>());
+        // Non-contiguous block -> get_vals gather path.
+        check(&mut accessor, &[0, 5, 9, 100, 199]);
+        // Single doc and full span.
+        check(&mut accessor, &[42]);
+        check(&mut accessor, &(0..200).collect::<Vec<u32>>());
     }
 }

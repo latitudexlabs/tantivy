@@ -16,10 +16,10 @@ pub(crate) mod index_writer;
 pub(crate) mod index_writer_status;
 pub(crate) mod indexing_term;
 mod log_merge_policy;
-mod merge_index_test;
 mod merge_operation;
 pub(crate) mod merge_policy;
 pub(crate) mod merger;
+mod merger_sorted_index_test;
 pub(crate) mod operation;
 pub(crate) mod prepared_commit;
 mod segment_entry;
@@ -208,7 +208,7 @@ mod tests_mmap {
         let index = Index::create_in_ram(schema_builder.build());
         let mut index_writer = index.writer_for_tests().unwrap();
         index_writer
-            .add_document(doc!(field=>json!({format!("{field_name_in}"): "test1", format!("num{field_name_in}"): 10})))
+            .add_document(doc!(field=>json!({field_name_in.to_string(): "test1", format!("num{field_name_in}"): 10})))
             .unwrap();
         index_writer
             .add_document(doc!(field=>json!({format!("a{field_name_in}"): "test2"})))

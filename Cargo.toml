@@ -66,7 +66,7 @@ tantivy-bitpacker = { version = "0.10", path = "./bitpacker" }
 common = { version = "0.11", path = "./common/", package = "tantivy-common" }
 tokenizer-api = { version = "0.7", path = "./tokenizer-api", package = "tantivy-tokenizer-api" }
 sketches-ddsketch = { version = "0.4", features = ["use_serde"] }
-datasketches = { git = "https://github.com/fulmicoton-dd/datasketches-rust", rev = "7635fb8" }
+datasketches = { version = "0.3.0", features = ["hll"] }
 futures-util = { version = "0.3.28", optional = true }
 futures-channel = { version = "0.3.28", optional = true }
 fnv = "1.0.7"
@@ -79,7 +79,7 @@ parking_lot = "0.12"
 winapi = "0.3.9"
 
 [dev-dependencies]
-binggan = "0.16.1"
+binggan = "0.17.0"
 rand = "0.9"
 maplit = "1.0.2"
 matches = "0.1.9"
@@ -97,7 +97,7 @@ postcard = { version = "1.0.4", features = [
 tokio = { version = "1.40.0", features = ["full"] }
 anyhow = "1.0.86"
 [target.'cfg(not(windows))'.dev-dependencies]
-criterion = { version = "0.5", default-features = false }
+criterion = { version = "0.8", default-features = false }
 
 [dev-dependencies.fail]
 version = "0.5.0"
@@ -208,10 +208,9 @@ name = "regex_all_terms"
 harness = false
 
 [[bench]]
-name = "ngram_phrase_query"
+name = "query_parser_nested"
 harness = false
 
 [[bench]]
-name = "fuzzy_phrase_query"
+name = "intersection_bench"
 harness = false
-
