@@ -282,9 +282,6 @@ mod tests {
             Box::new(RangeQuery::new(
                 Bound::Included(Term::from_field_u64(all_field, 50)),
                 Bound::Unbounded,
-                None,
-                None,
-                None
             )),
             Box::new(ExistsQuery::new("even".to_string(), false)),
         ]);
@@ -294,9 +291,6 @@ mod tests {
             Box::new(RangeQuery::new(
                 Bound::Included(Term::from_field_u64(all_field, 0)),
                 Bound::Included(Term::from_field_u64(all_field, 50)),
-                None,
-                None,
-                None
             )),
             Box::new(ExistsQuery::new("odd".to_string(), false)),
         ]);

@@ -70,10 +70,6 @@ use crate::{DocId, Score};
 #[derive(Clone, Debug)]
 pub struct RangeQuery {
     bounds: BoundsRange<Term>,
-    scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
-    base_scoring_value: Option<u64>,
-    /// 0 None(based on score), 1 Asc, 2 Desc
-    base_scoring_value_sort_order: Option<u8>
 }
 
 impl RangeQuery {
@@ -81,18 +77,9 @@ impl RangeQuery {
     ///
     /// If the value type is not correct, something may go terribly wrong when
     /// the `Weight` object is created.
-    pub fn new(
-        lower_bound: Bound<Term>,
-        upper_bound: Bound<Term>,
-        scoring_callback: Option<fn(Option<u64>, Option<u64>, Score, Option<u8>) -> Score>,
-        base_scoring_value: Option<u64>,
-        base_scoring_value_sort_order: Option<u8>
-    ) -> RangeQuery {
+    pub fn new(lower_bound: Bound<Term>, upper_bound: Bound<Term>) -> RangeQuery {
         RangeQuery {
             bounds: BoundsRange::new(lower_bound, upper_bound),
-            scoring_callback,
-            base_scoring_value,
-            base_scoring_value_sort_order
         }
     }
 
@@ -119,12 +106,7 @@ impl Query for RangeQuery {
         let field_type = schema.get_field_entry(self.field()).field_type();
 
         if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
-            Ok(Box::new(FastFieldRangeWeight::new(
-                self.bounds.clone(),
-                self.scoring_callback,
-                self.base_scoring_value,
-                self.base_scoring_value_sort_order
-            )))
+            Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
         } else {
             if field_type.is_json() {
                 return Err(crate::TantivyError::InvalidArgument(
@@ -397,9 +379,6 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_i64(int_field, 10)),
                 Bound::Excluded(Term::from_field_i64(int_field, 11)),
-                None,
-                None,
-                None,
             )),
             9
         );
@@ -407,9 +386,6 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_i64(int_field, 10)),
                 Bound::Included(Term::from_field_i64(int_field, 11)),
-                None,
-                None,
-                None,
             )),
             18
         );
@@ -417,19 +393,13 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Excluded(Term::from_field_i64(int_field, 9)),
                 Bound::Included(Term::from_field_i64(int_field, 10)),
-                None,
-                None,
-                None,
             )),
             9
         );
         assert_eq!(
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_i64(int_field, 9)),
-                Bound::Unbounded,
-                None,
-                None,
-                None,
+                Bound::Unbounded
             )),
             91
         );
@@ -480,9 +450,6 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_f64(float_field, 10.0)),
                 Bound::Excluded(Term::from_field_f64(float_field, 11.0)),
-                None,
-                None,
-                None,
             )),
             9
         );
@@ -490,9 +457,6 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_f64(float_field, 10.0)),
                 Bound::Included(Term::from_field_f64(float_field, 11.0)),
-                None,
-                None,
-                None,
             )),
             18
         );
@@ -500,19 +464,13 @@ mod tests {
             count_multiples(RangeQuery::new(
                 Bound::Excluded(Term::from_field_f64(float_field, 9.0)),
                 Bound::Included(Term::from_field_f64(float_field, 10.0)),
-                None,
-                None,
-                None,
             )),
             9
         );
         assert_eq!(
             count_multiples(RangeQuery::new(
                 Bound::Included(Term::from_field_f64(float_field, 9.0)),
-                Bound::Unbounded,
-                None,
-                None,
-                None,
+                Bound::Unbounded
             )),
             91
         );
@@ -723,7 +681,7 @@ mod tests {
         let make_scorer = move |lower_bound: Bound<u64>, upper_bound: Bound<u64>| {
             let lower_bound_term = lower_bound.map(make_term);
             let upper_bound_term = upper_bound.map(make_term);
-            let range_query = RangeQuery::new(lower_bound_term, upper_bound_term, None, None, None);
+            let range_query = RangeQuery::new(lower_bound_term, upper_bound_term);
             let range_weight = range_query
                 .weight(EnableScoring::disabled_from_schema(&schema))
                 .unwrap();

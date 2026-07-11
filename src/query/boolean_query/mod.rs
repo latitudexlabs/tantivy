@@ -398,7 +398,6 @@ mod tests {
         let effective_all_match_query: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(num_field, 0)),
             Bound::Unbounded,
-            None,None,None
         ));
         let term_query: Box<dyn Query> = Box::new(TermQuery::new(
             Term::from_field_text(text_field, "apple"),
@@ -467,7 +466,6 @@ mod tests {
         let all_match_query: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(num_field, 0)),
             Bound::Unbounded,
-            None,None,None
         ));
         let term_query: Box<dyn Query> = Box::new(TermQuery::new(
             Term::from_field_text(text_field, "hello"),
@@ -529,7 +527,6 @@ mod tests {
         let all_match_query: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(num_field, 0)),
             Bound::Unbounded,
-            None,None,None
         ));
         let term_query: Box<dyn Query> = Box::new(TermQuery::new(
             Term::from_field_text(text_field, "apple"),
@@ -581,7 +578,6 @@ mod tests {
         let range_query: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(age_field, 50)),
             Bound::Unbounded,
-            None,None,None
         ));
         let term_query: Box<dyn Query> = Box::new(TermQuery::new(
             Term::from_field_text(name_field, "alice"),
@@ -642,12 +638,10 @@ mod tests {
         let all_query1: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(num_field, 0)),
             Bound::Unbounded,
-            None,None,None
         ));
         let all_query2: Box<dyn Query> = Box::new(RangeQuery::new(
             Bound::Excluded(Term::from_field_i64(num_field, 5)),
             Bound::Unbounded,
-            None,None,None
         ));
         let term_query: Box<dyn Query> = Box::new(TermQuery::new(
             Term::from_field_text(text_field, "doc1"),
@@ -739,7 +733,6 @@ mod proptest_boolean_query {
                     Box::new(RangeQuery::new(
                         Bound::Included(Term::from_field_i64(range_field, 0)),
                         Bound::Unbounded,
-                        None,None,None
                     ))
                 }
                 BooleanQueryAST::Leaf { field_idx } => Box::new(TermQuery::new(

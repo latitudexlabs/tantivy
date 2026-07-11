@@ -169,9 +169,6 @@ fn main() -> Result<()> {
             index.schema().get_field("from")?,
             search_hnr,
         )),
-        None,
-        None,
-        None
     );
     let to_query = RangeQuery::new(
         Bound::Included(Term::from_field_u64(
@@ -179,9 +176,6 @@ fn main() -> Result<()> {
             search_hnr,
         )),
         Bound::Unbounded,
-        None,
-        None,
-        None
     );
 
     let interpolate_field = index.schema().get_field("interpolation")?;

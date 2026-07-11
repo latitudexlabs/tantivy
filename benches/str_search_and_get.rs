@@ -198,7 +198,7 @@ fn main() {
         let lower_term = Term::from_field_text(field, &lower_str);
         let upper_term = Term::from_field_text(field, &upper_str);
 
-        let query = RangeQuery::new(Bound::Included(lower_term), Bound::Included(upper_term), None, None, None);
+        let query = RangeQuery::new(Bound::Included(lower_term), Bound::Included(upper_term));
 
         run_benchmark_tasks(&mut group, &bench_index, query, range_low, range_high);
 
