@@ -1,7 +1,7 @@
 use super::PhraseWeight;
 use crate::query::bm25::Bm25Weight;
 use crate::query::ngram_query_optimizer::NgramQueryOptimizer;
-use crate::query::{EnableScoring, Query, Weight};
+use crate::query::{BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, Weight};
 use crate::schema::{Field, IndexRecordOption, Term};
 use std::sync::Arc;
 
@@ -157,21 +157,33 @@ impl Query for PhraseQuery {
     ///
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
-        // Try ngram optimization first
+        // When the field indexes word ngrams, intersect the phrase with a
+        // cheap ngram prefilter: any document containing the phrase also
+        // contains its consecutive bigrams/trigrams, so position
+        // verification only runs on documents that pass the prefilter.
         let schema = enable_scoring.schema();
         let optimizer = NgramQueryOptimizer::new(Arc::new(schema.clone()));
-        
-        if let Some(optimized_query) = optimizer.optimize_phrase_query(
-            self.field,
-            &self.phrase_terms,
-            self.slop,
-            enable_scoring.searcher(),
-        ) {
-            // Use the optimized query (ngram-based)
-            return optimized_query.weight(enable_scoring);
+
+        if let Some(ngram_prefilter) =
+            optimizer.phrase_ngram_prefilter(self.field, &self.phrase_terms, self.slop)
+        {
+            // The constant 0.0 score keeps the composed score identical to
+            // a plain phrase query; ExactPhraseWeightQuery bypasses this
+            // method so the prefilter is not re-applied recursively.
+            let filtered_query = BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    Box::new(ConstScoreQuery::new(ngram_prefilter, 0.0)) as Box<dyn Query>,
+                ),
+                (
+                    Occur::Must,
+                    Box::new(ExactPhraseWeightQuery(self.clone())) as Box<dyn Query>,
+                ),
+            ]);
+            return filtered_query.weight(enable_scoring);
         }
-        
-        // Fall back to regular phrase query
+
+        // No usable ngram index: plain position-based phrase query.
         let phrase_weight = self.phrase_weight(enable_scoring)?;
         Ok(Box::new(phrase_weight))
     }
@@ -180,5 +192,21 @@ impl Query for PhraseQuery {
         for (_, term) in &self.phrase_terms {
             visitor(term, true);
         }
+    }
+}
+
+/// Wrapper building the exact position-based weight of a phrase query,
+/// bypassing the ngram prefilter rewrite in [`PhraseQuery::weight`]. Used as
+/// the verification leg of the prefiltered composition.
+#[derive(Clone, Debug)]
+struct ExactPhraseWeightQuery(PhraseQuery);
+
+impl Query for ExactPhraseWeightQuery {
+    fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
+        Ok(Box::new(self.0.phrase_weight(enable_scoring)?))
+    }
+
+    fn query_terms<'a>(&'a self, visitor: &mut dyn FnMut(&'a Term, bool)) {
+        self.0.query_terms(visitor);
     }
 }

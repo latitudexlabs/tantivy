@@ -171,7 +171,7 @@ pub struct WordNgramConfig {
     /// **Performance:** Optimized to only generate combinations with the newest token
     /// in the sliding window, reducing computational overhead significantly.
     /// 
-    /// **Window size:** Controlled by `all_combinations_window_size` (default: 5)
+    /// **Window size:** Controlled by `all_combinations_window_size` (default: 100)
     /// 
     /// Default: false
     #[serde(default)]
@@ -192,7 +192,7 @@ pub struct WordNgramConfig {
     /// - N=5: 4 bigrams + 6 trigrams = 10 combinations per token
     /// - N=10: 9 bigrams + 36 trigrams = 45 combinations per token
     /// 
-    /// Default: 5 (good balance between coverage and performance)
+    /// Default: 100
     #[serde(default = "default_all_combinations_window_size")]
     pub all_combinations_window_size: usize,
     
