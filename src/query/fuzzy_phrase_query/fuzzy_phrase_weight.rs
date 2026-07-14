@@ -12,27 +12,28 @@ use std::sync::Arc;
 pub struct FuzzyPhraseWeight {
     phrase_terms: Arc<Vec<Term>>,
     min_match: usize,
-    similarity_weight_opt: Option<Bm25Weight>,
+    /// One weight per phrase term (query order); None disables scoring.
+    per_term_weights_opt: Option<Vec<Bm25Weight>>,
 }
 
 impl FuzzyPhraseWeight {
     /// Creates a new fuzzy phrase weight.
-    /// If `similarity_weight_opt` is None, then scoring is disabled
+    /// If `per_term_weights_opt` is None, then scoring is disabled
     pub fn new(
         phrase_terms: Arc<Vec<Term>>,
         min_match: usize,
-        similarity_weight_opt: Option<Bm25Weight>,
+        per_term_weights_opt: Option<Vec<Bm25Weight>>,
     ) -> FuzzyPhraseWeight {
         FuzzyPhraseWeight {
             phrase_terms,
             min_match,
-            similarity_weight_opt,
+            per_term_weights_opt,
         }
     }
 
     fn fieldnorm_reader(&self, reader: &SegmentReader) -> crate::Result<FieldNormReader> {
         let field = self.phrase_terms[0].field();
-        if self.similarity_weight_opt.is_some() {
+        if self.per_term_weights_opt.is_some() {
             if let Some(fieldnorm_reader) = reader.fieldnorms_readers().get_field(field)? {
                 return Ok(fieldnorm_reader);
             }
@@ -45,10 +46,12 @@ impl FuzzyPhraseWeight {
         reader: &SegmentReader,
         boost: Score,
     ) -> crate::Result<FuzzyPhraseScorer<SegmentPostings>> {
-        let similarity_weight_opt = self
-            .similarity_weight_opt
-            .as_ref()
-            .map(|similarity_weight| similarity_weight.boost_by(boost));
+        let per_term_weights_opt = self.per_term_weights_opt.as_ref().map(|weights| {
+            weights
+                .iter()
+                .map(|weight| weight.boost_by(boost))
+                .collect::<Vec<_>>()
+        });
         let fieldnorm_reader = self.fieldnorm_reader(reader)?;
 
         // The scorer drives candidate generation and position verification
@@ -66,7 +69,7 @@ impl FuzzyPhraseWeight {
         Ok(FuzzyPhraseScorer::new(
             term_postings_list,
             self.min_match,
-            similarity_weight_opt,
+            per_term_weights_opt,
             fieldnorm_reader,
         ))
     }
@@ -84,14 +87,12 @@ impl Weight for FuzzyPhraseWeight {
         if scorer.doc() > doc || scorer.seek(doc) != doc {
             return Err(does_not_match(doc));
         }
-        let fieldnorm_reader = self.fieldnorm_reader(reader)?;
-        let fieldnorm_id = fieldnorm_reader.fieldnorm_id(doc);
         let match_count = scorer.match_count();
         let mut explanation = Explanation::new("FuzzyPhraseScorer", scorer.score());
-        explanation.add_detail(Explanation::new("matches", match_count as Score));
-        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
-            explanation.add_detail(similarity_weight.explain(fieldnorm_id, match_count));
-        }
+        explanation.add_detail(Explanation::new(
+            "matches (score = sum of matched terms' bm25 weights)",
+            match_count as Score,
+        ));
         Ok(explanation)
     }
 }

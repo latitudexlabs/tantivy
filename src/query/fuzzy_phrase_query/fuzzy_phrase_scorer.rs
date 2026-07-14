@@ -20,7 +20,7 @@ pub struct FuzzyPhraseScorer<TPostings: Postings> {
     min_match: usize,
     match_count: usize,
     fieldnorm_reader: FieldNormReader,
-    similarity_weight_opt: Option<Bm25Weight>,
+    per_term_weights_opt: Option<Vec<Bm25Weight>>,
     current_doc: DocId,
     // Reusable position buffers to avoid allocations, one per term.
     position_buffers: Vec<Vec<u32>>,
@@ -38,7 +38,7 @@ impl<TPostings: Postings> FuzzyPhraseScorer<TPostings> {
     pub fn new(
         phrase_postings: Vec<TPostings>,
         min_match: usize,
-        similarity_weight_opt: Option<Bm25Weight>,
+        per_term_weights_opt: Option<Vec<Bm25Weight>>,
         fieldnorm_reader: FieldNormReader,
     ) -> FuzzyPhraseScorer<TPostings> {
         assert!(phrase_postings.len() >= 2);
@@ -65,7 +65,7 @@ impl<TPostings: Postings> FuzzyPhraseScorer<TPostings> {
             min_match,
             match_count: 0,
             fieldnorm_reader,
-            similarity_weight_opt,
+            per_term_weights_opt,
             current_doc: TERMINATED,
             position_buffers: vec![Vec::new(); num_terms],
             chain_tails: Vec::new(),
@@ -130,7 +130,7 @@ impl<TPostings: Postings> FuzzyPhraseScorer<TPostings> {
     /// Runs the in-order check on `doc` (postings must already be positioned)
     /// and records the resulting `match_count`.
     fn check_candidate(&mut self, doc: DocId) -> bool {
-        let scoring_enabled = self.similarity_weight_opt.is_some();
+        let scoring_enabled = self.per_term_weights_opt.is_some();
         if self.min_match == 1 && !scoring_enabled {
             // Any present term forms a chain of length 1: no need to decode
             // positions when the count is not used for scoring.
@@ -215,9 +215,21 @@ impl<TPostings: Postings> DocSet for FuzzyPhraseScorer<TPostings> {
 
 impl<TPostings: Postings> Scorer for FuzzyPhraseScorer<TPostings> {
     fn score(&mut self) -> Score {
-        if let Some(similarity_weight) = self.similarity_weight_opt.as_ref() {
-            let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(self.doc());
-            similarity_weight.score(fieldnorm_id, self.match_count as u32)
+        if let Some(per_term_weights) = self.per_term_weights_opt.as_ref() {
+            // Sum the bm25 weight of every phrase term present on this doc:
+            // more matched terms -> higher score, and among equal match
+            // counts, rarer matched terms win. A single combined weight
+            // multiplied by match_count ties every equal-count doc when
+            // fieldnorms are disabled.
+            let doc = self.current_doc;
+            let fieldnorm_id = self.fieldnorm_reader.fieldnorm_id(doc);
+            let mut score = 0.0;
+            for (postings, weight) in self.phrase_postings.iter().zip(per_term_weights) {
+                if postings.doc() == doc {
+                    score += weight.score(fieldnorm_id, 1);
+                }
+            }
+            score
         } else {
             1.0
         }

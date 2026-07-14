@@ -224,21 +224,30 @@ impl FuzzyPhraseQuery {
             )));
         }
 
-        let bm25_weight_opt = match enable_scoring {
+        // One Bm25Weight PER TERM: the scorer sums the weights of the terms
+        // present on a document, so rare matched terms outrank common ones.
+        // A single combined weight multiplied by match_count would give every
+        // document with the same match count an identical score (fieldnorms
+        // are often disabled on ngram fields), making ordering arbitrary.
+        let bm25_weights_opt = match enable_scoring {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Some(Bm25Weight::for_terms(
-                statistics_provider,
-                &self.phrase_terms,
-            )?),
+            } => Some(
+                self.phrase_terms
+                    .iter()
+                    .map(|term| {
+                        Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(term))
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?,
+            ),
             EnableScoring::Disabled { .. } => None,
         };
 
         Ok(FuzzyPhraseWeight::new(
             Arc::clone(&self.phrase_terms),
             self.min_match,
-            bm25_weight_opt,
+            bm25_weights_opt,
         ))
     }
 }
@@ -280,6 +289,49 @@ impl Query for FuzzyPhraseQuery {
 
 #[cfg(test)]
 mod tests {
+#[test]
+fn test_ngram_rewrite_scores_by_clause_idf() -> crate::Result<()> {
+    // The ngram rewrite produces one TermQuery clause per ordered pair; each
+    // clause must carry its own idf so a rare matched pair outscores a
+    // common one. Guards against doc_freq being stubbed out (a constant df
+    // makes every equal-match-count doc tie and order by docid).
+    use crate::collector::TopDocs;
+    use crate::query::FuzzyPhraseQuery;
+    use crate::schema::{Schema, TextFieldIndexing, TEXT, IndexRecordOption};
+    use crate::{Index, Term, WordNgramConfig, WordNgramSet, doc};
+
+    let text_indexing = TextFieldIndexing::default()
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+        .set_word_ngrams(
+            WordNgramConfig::with_set(WordNgramSet::new().with_ngram_ff())
+                .with_all_combinations()
+                .with_all_combinations_window_size(3),
+        );
+    let mut sb = Schema::builder();
+    let f = sb.add_text_field("text", TEXT.clone().set_indexing_options(text_indexing));
+    let schema = sb.build();
+    let index = Index::create_in_ram(schema);
+    let mut w = index.writer(15_000_000)?;
+    for _ in 0..50 {
+        w.add_document(doc!(f => "alpha beta filler"))?;
+    }
+    w.add_document(doc!(f => "gamma delta filler"))?;
+    w.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let common = FuzzyPhraseQuery::new(
+        vec![Term::from_field_text(f, "alpha"), Term::from_field_text(f, "beta")], 2);
+    let rare = FuzzyPhraseQuery::new(
+        vec![Term::from_field_text(f, "gamma"), Term::from_field_text(f, "delta")], 2);
+    let sc = searcher.search(&common, &TopDocs::with_limit(1).order_by_score())?[0].0;
+    let sr = searcher.search(&rare, &TopDocs::with_limit(1).order_by_score())?[0].0;
+    assert!(
+        sr > sc,
+        "rare pair must outscore common pair (idf), got rare={sr} common={sc}"
+    );
+    Ok(())
+}
+
     use super::*;
     use crate::schema::Schema;
     use crate::{Index, Term};

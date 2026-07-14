@@ -492,11 +492,61 @@ impl Query for FuzzyTermQuery {
 #[cfg(test)]
 mod test {
     use super::FuzzyTermQuery;
-    use crate::collector::{Count, TopDocs};
+    use crate::collector::{Count, DocSetCollector, TopDocs};
     use crate::indexer::NoMergePolicy;
     use crate::query::QueryParser;
     use crate::schema::{Schema, STORED, TEXT};
     use crate::{assert_nearly_equals, Index, IndexWriter, TantivyDocument, Term};
+
+    #[test]
+    fn test_fuzzy_max_expansions_keeps_closest_terms() -> crate::Result<()> {
+        // Five distance-1 terms that sort lexicographically BEFORE the exact
+        // term, plus the exact (distance-0) term "foo". `max_expansions` must
+        // keep the closest terms by edit distance, not the first N in the term
+        // dictionary, so the exact match must never be crowded out.
+        let mut schema_builder = Schema::builder();
+        let field = schema_builder.add_text_field("t", TEXT);
+        let index = Index::create_in_ram(schema_builder.build());
+        // Single thread => single segment => deterministic term ordering.
+        let mut writer = index.writer_with_num_threads(1, 15_000_000)?;
+        for term_text in ["aoo", "boo", "coo", "doo", "eoo", "foo"] {
+            writer.add_document(doc!(field => term_text))?;
+        }
+        writer.commit()?;
+        let searcher = index.reader()?.searcher();
+        assert_eq!(searcher.segment_readers().len(), 1, "expected a single segment");
+
+        let exact_doc = 5u32; // "foo"
+        let first_distance_1_doc = 0u32; // "aoo"
+
+        // cap = 1: only the exact match (distance 0) should survive.
+        let mut query = FuzzyTermQuery::new(Term::from_field_text(field, "foo"), 1, true);
+        query.set_max_expansions(Some(1));
+        let mut ids: Vec<u32> = searcher
+            .search(&query, &DocSetCollector)?
+            .iter()
+            .map(|addr| addr.doc_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![exact_doc], "cap=1 must keep the exact match 'foo'");
+
+        // cap = 2: the exact match plus the lexicographically-first of the
+        // equally-distant (distance-1) terms, "aoo".
+        query.set_max_expansions(Some(2));
+        let mut ids: Vec<u32> = searcher
+            .search(&query, &DocSetCollector)?
+            .iter()
+            .map(|addr| addr.doc_id)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![first_distance_1_doc, exact_doc],
+            "cap=2 must keep the exact match plus the earliest distance-1 term"
+        );
+
+        Ok(())
+    }
 
     #[test]
     pub fn test_fuzzy_json_path() -> crate::Result<()> {
