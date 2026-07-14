@@ -122,7 +122,7 @@ impl Weight for FastFieldRangeWeight {
                     else {
                         return Ok(Box::new(EmptyScorer));
                     };
-                    search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), false)
+                    search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), None)
                 }
                 Type::U64 | Type::I64 | Type::F64 => {
                     search_on_json_numerical_field(reader, &field_name, typ, bounds, boost)
@@ -139,7 +139,7 @@ impl Weight for FastFieldRangeWeight {
                         column,
                         boost,
                         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
-                        false,
+                        None,
                     )
                 }
                 Type::Bool | Type::Facet | Type::Bytes | Type::Json | Type::IpAddr => {
@@ -187,7 +187,7 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
-            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), false)
+            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), None)
         } else if field_type.is_bytes() {
             let Some(bytes_column): Option<BytesColumn> =
                 reader.fast_fields().bytes(&field_name)?
@@ -206,7 +206,7 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
-            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), false)
+            search_on_u64_ff(column, boost, BoundsRange::new(lower_bound, upper_bound), None)
         } else {
             assert!(
                 maps_to_u64_fastfield(field_type.value_type()),
@@ -244,11 +244,22 @@ impl Weight for FastFieldRangeWeight {
             else {
                 return Ok(Box::new(EmptyScorer));
             };
+            // Detect the index sort from the segment itself; the legacy
+            // caller-supplied asc hint still works but is no longer needed.
+            let index_sorted = reader
+                .sort_by_field()
+                .filter(|sort| sort.field == field_name)
+                .map(|sort| sort.order)
+                .or(if self.index_sorted_asc {
+                    Some(crate::Order::Asc)
+                } else {
+                    None
+                });
             search_on_u64_ff(
                 column,
                 boost,
                 BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
-                self.index_sorted_asc,
+                index_sorted,
             )
         }
     }
@@ -352,7 +363,7 @@ fn search_on_json_numerical_field(
         column,
         boost,
         BoundsRange::new(bounds.lower_bound, bounds.upper_bound),
-        false,
+        None,
     )
 }
 
@@ -431,7 +442,7 @@ fn search_on_u64_ff(
     column: Column<u64>,
     boost: Score,
     bounds: BoundsRange<u64>,
-    index_sorted_asc: bool,
+    index_sorted: Option<crate::Order>,
 ) -> crate::Result<Box<dyn Scorer>> {
     let col_min_value = column.min_value();
     let col_max_value = column.max_value();
@@ -462,17 +473,31 @@ fn search_on_u64_ff(
         }
     }
 
-    // Index sorted ascending by this field: matching docs are one contiguous
-    // doc-id run — find its ends by binary search (O(log n) column reads)
-    // instead of scanning every value. Only valid for full-cardinality
-    // columns, where row index == doc id.
-    if index_sorted_asc && column.index.get_cardinality() == Cardinality::Full {
+    // Index sorted by this field: matching docs are one contiguous doc-id
+    // run — find its ends by binary search (O(log n) column reads) instead
+    // of scanning every value. Only valid for full-cardinality columns,
+    // where row index == doc id.
+    if column.index.get_cardinality() == Cardinality::Full {
         let num_docs = column.num_docs();
         let values = &column.values;
-        let start = partition_point_docs(num_docs, |doc| values.get_val(doc) < *value_range.start());
-        let end = partition_point_docs(num_docs, |doc| values.get_val(doc) <= *value_range.end());
-        let docset = SortedColumnRangeDocSet::new(start, end);
-        return Ok(Box::new(ConstScorer::new(docset, boost)));
+        let run = match index_sorted {
+            Some(crate::Order::Asc) => Some((
+                partition_point_docs(num_docs, |doc| values.get_val(doc) < *value_range.start()),
+                partition_point_docs(num_docs, |doc| values.get_val(doc) <= *value_range.end()),
+            )),
+            // Descending: docs above the range form the prefix, so the run
+            // starts where values drop to <= end and stops where they drop
+            // below start.
+            Some(crate::Order::Desc) => Some((
+                partition_point_docs(num_docs, |doc| values.get_val(doc) > *value_range.end()),
+                partition_point_docs(num_docs, |doc| values.get_val(doc) >= *value_range.start()),
+            )),
+            None => None,
+        };
+        if let Some((start, end)) = run {
+            let docset = SortedColumnRangeDocSet::new(start, end);
+            return Ok(Box::new(ConstScorer::new(docset, boost)));
+        }
     }
 
     let docset = RangeDocSet::new(value_range, column);
@@ -551,6 +576,30 @@ impl crate::DocSet for SortedColumnRangeDocSet {
         } else {
             self.end - self.doc
         }
+    }
+
+    fn fill_buffer(
+        &mut self,
+        buffer: &mut [DocId; crate::COLLECT_BLOCK_BUFFER_LEN],
+    ) -> usize {
+        if self.doc == crate::TERMINATED {
+            return 0;
+        }
+        // Consecutive ids: write the block directly instead of advancing
+        // one document at a time.
+        let count = ((self.end - self.doc) as usize).min(crate::COLLECT_BLOCK_BUFFER_LEN);
+        for (offset, slot) in buffer[..count].iter_mut().enumerate() {
+            *slot = self.doc + offset as DocId;
+        }
+        self.doc += count as DocId;
+        if self.doc >= self.end {
+            self.doc = crate::TERMINATED;
+        }
+        count
+    }
+
+    fn cost(&self) -> u64 {
+        self.size_hint() as u64
     }
 }
 
@@ -1923,5 +1972,96 @@ mod index_sorted_range_tests {
         assert_eq!(seeker.seek(50), 50); // seek to current stays
         assert_eq!(seeker.seek(99), 99);
         assert_eq!(seeker.seek(100), TERMINATED);
+    }
+
+    #[test]
+    fn sorted_run_docset_fill_buffer() {
+        use super::SortedColumnRangeDocSet;
+        use crate::{COLLECT_BLOCK_BUFFER_LEN, DocSet, TERMINATED};
+
+        // Run larger than one block: fills a whole consecutive block, then
+        // the remainder, then reports exhaustion.
+        let mut docset = SortedColumnRangeDocSet::new(10, 10 + COLLECT_BLOCK_BUFFER_LEN as u32 + 5);
+        let mut buffer = [0u32; COLLECT_BLOCK_BUFFER_LEN];
+        assert_eq!(docset.fill_buffer(&mut buffer), COLLECT_BLOCK_BUFFER_LEN);
+        assert_eq!(buffer[0], 10);
+        assert_eq!(buffer[COLLECT_BLOCK_BUFFER_LEN - 1], 10 + COLLECT_BLOCK_BUFFER_LEN as u32 - 1);
+        assert_eq!(docset.fill_buffer(&mut buffer), 5);
+        assert_eq!(buffer[..5], [74, 75, 76, 77, 78]);
+        assert_eq!(docset.doc(), TERMINATED);
+        assert_eq!(docset.fill_buffer(&mut buffer), 0);
+
+        // A partially consumed run only fills what remains.
+        let mut docset = SortedColumnRangeDocSet::new(0, 8);
+        docset.advance();
+        docset.advance();
+        assert_eq!(docset.fill_buffer(&mut buffer), 6);
+        assert_eq!(buffer[..6], [2, 3, 4, 5, 6, 7]);
+    }
+
+    /// Sorted-index fast path engages from the segment's own sort metadata —
+    /// a plain RangeQuery (no caller hint) must return correct results on
+    /// both ascending and descending sorted indexes.
+    #[test]
+    fn range_query_auto_detects_index_sort() -> crate::Result<()> {
+        use crate::collector::TopDocs;
+        use crate::indexer::NoMergePolicy;
+        use crate::query::RangeQuery;
+        use crate::schema::{NumericOptions, Schema};
+        use crate::{doc, Index, IndexSettings, IndexSortByField, Order, Term};
+
+        for order in [Order::Asc, Order::Desc] {
+            let mut schema_builder = Schema::builder();
+            let field = schema_builder
+                .add_u64_field("val", NumericOptions::default().set_fast().set_indexed());
+            let schema = schema_builder.build();
+            let settings = IndexSettings {
+                sort_by_field: Some(IndexSortByField {
+                    field: "val".to_string(),
+                    order,
+                }),
+                ..Default::default()
+            };
+            let index = Index::builder()
+                .schema(schema)
+                .settings(settings)
+                .create_in_ram()?;
+            let mut writer = index.writer(15_000_000)?;
+            writer.set_merge_policy(Box::new(NoMergePolicy));
+            for v in [55u64, 5, 95, 25, 85, 15, 45, 75, 35, 65] {
+                writer.add_document(doc!(field => v))?;
+            }
+            writer.commit()?;
+            let searcher = index.reader()?.searcher();
+
+            let query = RangeQuery::new(
+                std::ops::Bound::Included(Term::from_field_u64(field, 20)),
+                std::ops::Bound::Included(Term::from_field_u64(field, 70)),
+            );
+            let hits = searcher.search(&query, &TopDocs::with_limit(20).order_by_score())?;
+            let mut values: Vec<u64> = hits
+                .iter()
+                .map(|(_, addr)| {
+                    let reader = &searcher.segment_readers()[addr.segment_ord as usize];
+                    let col = reader.fast_fields().u64("val").unwrap();
+                    col.values.get_val(addr.doc_id)
+                })
+                .collect();
+            values.sort_unstable();
+            assert_eq!(
+                values,
+                vec![25, 35, 45, 55, 65],
+                "order {order:?}: sorted fast path must return exactly the in-range docs"
+            );
+
+            // The matching docs must be one contiguous doc-id block (the
+            // whole point of the sorted fast path).
+            let mut doc_ids: Vec<u32> = hits.iter().map(|(_, addr)| addr.doc_id).collect();
+            doc_ids.sort_unstable();
+            for pair in doc_ids.windows(2) {
+                assert_eq!(pair[1], pair[0] + 1, "run must be contiguous, got {doc_ids:?}");
+            }
+        }
+        Ok(())
     }
 }

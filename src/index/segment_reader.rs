@@ -51,6 +51,10 @@ pub struct SegmentReader {
     
     /// Per-field frequent term trackers for ngram query optimization (computed lazily)
     frequent_terms_cache: Arc<RwLock<HashMap<u32, Arc<crate::indexer::FrequentTermTracker>>>>,
+
+    /// The index-level sort, captured at open time so queries can detect
+    /// sorted-column fast paths without caller-supplied hints.
+    sort_by_field: Option<crate::IndexSortByField>,
 }
 
 impl SegmentReader {
@@ -207,9 +211,18 @@ impl SegmentReader {
             positions_composite,
             schema,
             frequent_terms_cache: Arc::new(RwLock::new(HashMap::new())),
+            sort_by_field: segment.index().settings().sort_by_field.clone(),
         })
     }
     
+    /// The field this index is sorted by, if any. Every segment of a sorted
+    /// index is individually sorted (the writer sorts at serialization and
+    /// merges preserve the order), so queries on the sort field can use
+    /// contiguous-run fast paths.
+    pub fn sort_by_field(&self) -> Option<&crate::IndexSortByField> {
+        self.sort_by_field.as_ref()
+    }
+
     /// Get or compute the frequent term tracker for a specific field.
     /// Computes lazily from term dictionary on first access and caches the result.
     pub fn get_frequent_terms(&self, field_id: u32) -> Option<Arc<crate::indexer::FrequentTermTracker>> {
