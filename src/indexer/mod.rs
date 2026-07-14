@@ -1709,6 +1709,85 @@ mod tests_mmap {
     }
 
     #[test]
+    fn test_unigram_edge_ngrams() -> crate::Result<()> {
+        // unigram_edge_ngram additionally indexes each token's prefixes as
+        // standalone terms at the token's position, so single-word prefix
+        // lookups and position-based phrase matching work mid-word.
+        let build_index = |unigram: bool| -> crate::Result<Index> {
+            let mut config = WordNgramConfig::with_set(WordNgramSet::new().with_ngram_ff())
+                .with_all_combinations()
+                .with_all_combinations_window_size(3)
+                .with_edge_ngram()
+                .with_min_edge_ngram(3);
+            if unigram {
+                config = config.with_unigram_edge_ngram();
+            }
+            let text_indexing = TextFieldIndexing::default()
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                .set_word_ngrams(config);
+            let mut schema_builder = Schema::builder();
+            let text_field = schema_builder
+                .add_text_field("text", TEXT.clone().set_indexing_options(text_indexing));
+            let schema = schema_builder.build();
+            let index = Index::create_in_ram(schema);
+            let mut index_writer = index.writer(15_000_000)?;
+            index_writer.add_document(doc!(text_field => "5804 berwyn road"))?;
+            index_writer.commit()?;
+            Ok(index)
+        };
+
+        let index = build_index(true)?;
+        let searcher = index.reader()?.searcher();
+        let text_field = index.schema().get_field("text").unwrap();
+
+        let count = |term_text: &str| -> crate::Result<usize> {
+            let q = TermQuery::new(
+                Term::from_field_text(text_field, term_text),
+                IndexRecordOption::Basic,
+            );
+            Ok(searcher
+                .search(&q, &TopDocs::with_limit(10).order_by_score())?
+                .len())
+        };
+
+        // Prefixes from min_edge_ngram (3) up to len-1 exist as unigram terms.
+        for present in ["ber", "berw", "berwy", "berwyn", "580", "5804", "roa", "road"] {
+            assert_eq!(count(present)?, 1, "term '{present}' should be indexed");
+        }
+        // Below min_edge_ngram: absent.
+        for absent in ["be", "b", "58", "ro"] {
+            assert_eq!(count(absent)?, 0, "term '{absent}' should NOT be indexed");
+        }
+
+        // Prefix terms carry the source token's position: an exact phrase
+        // with a prefix in second position must match.
+        let phrase = crate::query::PhraseQuery::new(vec![
+            Term::from_field_text(text_field, "5804"),
+            Term::from_field_text(text_field, "berw"),
+        ]);
+        let hits = searcher.search(&phrase, &TopDocs::with_limit(10).order_by_score())?;
+        assert_eq!(hits.len(), 1, "positional phrase over a prefix term should match");
+
+        // Control: without the flag, prefixes are not standalone terms.
+        let index_off = build_index(false)?;
+        let searcher_off = index_off.reader()?.searcher();
+        let field_off = index_off.schema().get_field("text").unwrap();
+        let q = TermQuery::new(
+            Term::from_field_text(field_off, "berw"),
+            IndexRecordOption::Basic,
+        );
+        assert_eq!(
+            searcher_off
+                .search(&q, &TopDocs::with_limit(10).order_by_score())?
+                .len(),
+            0,
+            "prefix term must be absent when unigram_edge_ngram is off"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn test_edge_ngrams_min_length() -> crate::Result<()> {
         // Test that min_edge_ngram controls the minimum edge ngram length
         let mut schema_builder = Schema::builder();

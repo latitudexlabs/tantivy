@@ -312,6 +312,7 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
             combinations_window_size,
             edge_ngram_enabled,
             min_edge_ngram,
+            unigram_edge_enabled,
         ) = if let Some(ref config) = self.ngram_config {
             (
                 config.contains_bigrams(),
@@ -320,9 +321,10 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
                 config.all_combinations_window_size,
                 config.edge_ngram,
                 config.min_edge_ngram,
+                config.unigram_edge_ngram,
             )
         } else {
-            (false, false, false, 5, false, 2)
+            (false, false, false, 5, false, 2, false)
         };
 
         token_stream.process(&mut |token: &Token| {
@@ -344,6 +346,30 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
             end_position = end_position.max(start_position + token.position_length as u32);
             self.subscribe(doc_id, start_position, term_buffer, ctx);
             num_tokens += 1;
+
+            // Additionally index each edge prefix of the token as a
+            // standalone term at the SAME position, so single-word prefix
+            // lookups and position-based phrase matching work on partially
+            // typed words. num_tokens is deliberately not incremented:
+            // prefixes are aliases of the token, not extra content, and must
+            // not inflate fieldnorms.
+            if unigram_edge_enabled {
+                let token_text = &token.text;
+                let char_count = token_text.chars().count();
+                if char_count > min_edge_ngram {
+                    for (prefix_chars, (byte_idx, _)) in token_text.char_indices().enumerate() {
+                        // char_indices yields the start byte of each char, so
+                        // byte_idx cuts a prefix of exactly prefix_chars chars;
+                        // the full token (prefix_chars == char_count) never
+                        // appears here and stays indexed only once above.
+                        if prefix_chars >= min_edge_ngram {
+                            term_buffer.truncate_value_bytes(end_of_path_idx);
+                            term_buffer.append_bytes(token_text[..byte_idx].as_bytes());
+                            self.subscribe(doc_id, start_position, term_buffer, ctx);
+                        }
+                    }
+                }
+            }
 
             // Generate ngrams if configured
             // Note: We generate ALL ngrams for configured types (FF, FR, RF, etc.) without
