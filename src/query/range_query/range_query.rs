@@ -106,7 +106,26 @@ impl Query for RangeQuery {
         let field_type = schema.get_field_entry(self.field()).field_type();
 
         if field_type.is_fast() && is_type_valid_for_fastfield_range_query(self.value_type()) {
-            Ok(Box::new(FastFieldRangeWeight::new(self.bounds.clone())))
+            // When the index is sorted (ascending) by this exact field, the
+            // docs matching a value range form one contiguous doc-id run per
+            // segment — the weight can then binary-search the column instead
+            // of scanning every value.
+            let field_name = schema.get_field_entry(self.field()).name();
+            let searcher_opt = match &enable_scoring {
+                EnableScoring::Enabled { searcher, .. } => Some(*searcher),
+                EnableScoring::Disabled { searcher_opt, .. } => *searcher_opt,
+            };
+            let index_sorted_asc = searcher_opt
+                .and_then(|searcher| searcher.index().settings().sort_by_field.as_ref())
+                .map(|sort_by_field| {
+                    sort_by_field.field == field_name
+                        && sort_by_field.order == crate::index::Order::Asc
+                })
+                .unwrap_or(false);
+            Ok(Box::new(FastFieldRangeWeight::new_with_index_sort_hint(
+                self.bounds.clone(),
+                index_sorted_asc,
+            )))
         } else {
             if field_type.is_json() {
                 return Err(crate::TantivyError::InvalidArgument(
