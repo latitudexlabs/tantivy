@@ -36,6 +36,7 @@ use crossbeam_channel as channel;
 use smallvec::SmallVec;
 
 pub use self::frequent_terms::FrequentTermTracker;
+pub use self::doc_id_mapping::DocIdMapping;
 pub use self::index_writer::{advance_deletes, IndexWriter, IndexWriterOptions};
 pub use self::log_merge_policy::LogMergePolicy;
 pub use self::merge_operation::MergeOperation;
