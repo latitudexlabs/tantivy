@@ -20,6 +20,11 @@ use crate::DocId;
 
 const POSITION_GAP: u32 = 1;
 
+/// Number of token positions kept in the sliding window when generating
+/// consecutive (non-`all_combinations`) ngrams: at most the last three tokens
+/// are needed to emit adjacent bigrams and trigrams.
+const CONSECUTIVE_NGRAM_WINDOW: usize = 3;
+
 fn make_field_partition(
     term_offsets: &[(Field, OrderedPathId, &[u8], Addr)],
 ) -> Vec<(Field, Range<usize>)> {
@@ -209,10 +214,26 @@ impl<Rec: Recorder> From<SpecializedPostingsWriter<Rec>> for Box<dyn PostingsWri
 impl<Rec: Recorder> SpecializedPostingsWriter<Rec> {
     /// Create a new postings writer with optional ngram configuration
     pub(crate) fn with_ngram_config(ngram_config: Option<WordNgramConfig>) -> Self {
+        // Pre-size the sliding window to the maximum number of token groups it
+        // will hold while indexing, so it does not reallocate as tokens stream
+        // in. `index_text` pushes one group before trimming, so the transient
+        // peak is one above the steady-state window size.
+        let window_capacity = match &ngram_config {
+            Some(config) if config.contains_bigrams() || config.contains_trigrams() => {
+                let window = if config.all_combinations {
+                    config.all_combinations_window_size
+                } else {
+                    CONSECUTIVE_NGRAM_WINDOW
+                };
+                window.saturating_add(1)
+            }
+            // No ngrams: the window is never populated.
+            _ => 0,
+        };
         Self {
             total_num_tokens: 0,
             _recorder_type: PhantomData,
-            term_window: VecDeque::with_capacity(3),
+            term_window: VecDeque::with_capacity(window_capacity),
             ngram_config,
             ngram_buffer: String::with_capacity(64),
             seen_ngrams: HashSet::new(),
@@ -291,6 +312,7 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
             combinations_window_size,
             edge_ngram_enabled,
             min_edge_ngram,
+            unigram_edge_enabled,
         ) = if let Some(ref config) = self.ngram_config {
             (
                 config.contains_bigrams(),
@@ -299,13 +321,11 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
                 config.all_combinations_window_size,
                 config.edge_ngram,
                 config.min_edge_ngram,
+                config.unigram_edge_ngram,
             )
         } else {
-            (false, false, false, 5, false, 2)
+            (false, false, false, 5, false, 2, false)
         };
-
-        // Temporary buffer for edge ngrams to avoid repeated allocations
-        let mut edge_ngrams = Vec::with_capacity(10);
 
         token_stream.process(&mut |token: &Token| {
             // We skip all tokens with a len greater than u16.
@@ -327,50 +347,78 @@ impl<Rec: Recorder> PostingsWriter for SpecializedPostingsWriter<Rec> {
             self.subscribe(doc_id, start_position, term_buffer, ctx);
             num_tokens += 1;
 
+            // Additionally index each edge prefix of the token as a
+            // standalone term at the SAME position, so single-word prefix
+            // lookups and position-based phrase matching work on partially
+            // typed words. num_tokens is deliberately not incremented:
+            // prefixes are aliases of the token, not extra content, and must
+            // not inflate fieldnorms.
+            if unigram_edge_enabled {
+                let token_text = &token.text;
+                let char_count = token_text.chars().count();
+                if char_count > min_edge_ngram {
+                    for (prefix_chars, (byte_idx, _)) in token_text.char_indices().enumerate() {
+                        // char_indices yields the start byte of each char, so
+                        // byte_idx cuts a prefix of exactly prefix_chars chars;
+                        // the full token (prefix_chars == char_count) never
+                        // appears here and stays indexed only once above.
+                        if prefix_chars >= min_edge_ngram {
+                            term_buffer.truncate_value_bytes(end_of_path_idx);
+                            term_buffer.append_bytes(token_text[..byte_idx].as_bytes());
+                            self.subscribe(doc_id, start_position, term_buffer, ctx);
+                        }
+                    }
+                }
+            }
+
             // Generate ngrams if configured
             // Note: We generate ALL ngrams for configured types (FF, FR, RF, etc.) without
             // filtering by actual frequency during indexing. Frequency-based selection happens
             // at query time when the FrequentTermTracker data is available.
             if should_gen_bigrams || should_gen_trigrams {
-                // Generate edge ngrams if enabled
-                edge_ngrams.clear();
-                if edge_ngram_enabled {
-                    // Generate progressive prefixes from min_edge_ngram to full length
+                // Build this token's edge-ngram group. It is moved into the
+                // sliding window below, so a fresh allocation is unavoidable
+                // per token; size it exactly to avoid intermediate reallocations.
+                let edge_ngrams: Vec<String> = if edge_ngram_enabled {
+                    // Progressive prefixes from min_edge_ngram up to the full token.
                     let token_text = &token.text;
-                    
-                    // Always include the full token
-                    edge_ngrams.push(token_text.to_string());
-
-                    // Generate prefixes from full_len-1 down to min_edge_ngram
-                    // Optimize by collecting char indices once if needed
                     let char_count = token_text.chars().count();
+                    let mut edges =
+                        Vec::with_capacity(1 + char_count.saturating_sub(min_edge_ngram));
+
+                    // Always include the full token.
+                    edges.push(token_text.to_string());
+
+                    // Generate prefixes from full_len-1 down to min_edge_ngram.
                     if char_count > min_edge_ngram {
-                        // Build a char index map for efficient prefix extraction
-                        let char_indices: Vec<usize> = token_text.char_indices()
+                        // Build a char index map for efficient prefix extraction.
+                        let char_indices: Vec<usize> = token_text
+                            .char_indices()
                             .map(|(i, _)| i)
                             .chain(std::iter::once(token_text.len()))
                             .collect();
-                        
+
                         for prefix_len in (min_edge_ngram..char_count).rev() {
-                            edge_ngrams.push(token_text[..char_indices[prefix_len]].to_string());
+                            edges.push(token_text[..char_indices[prefix_len]].to_string());
                         }
                     }
+                    edges
                 } else {
-                    // No edge ngrams, just use the full token
-                    edge_ngrams.push(token.text.to_string());
-                }
+                    // No edge ngrams, just use the full token.
+                    vec![token.text.to_string()]
+                };
 
                 // Add edge ngrams as a group to the sliding window (move instead of clone)
                 // This ensures we don't generate combinations within the same token position
-                self.term_window.push_back(std::mem::take(&mut edge_ngrams));
+                self.term_window.push_back(edge_ngrams);
 
                 // Keep window size limited based on mode
                 let max_window_size = if all_combinations {
                     // Use configured window size for all_combinations mode
                     combinations_window_size
                 } else {
-                    // In consecutive mode, only need last 3 tokens
-                    3
+                    // In consecutive mode, only need the last few tokens
+                    CONSECUTIVE_NGRAM_WINDOW
                 };
 
                 while self.term_window.len() > max_window_size {

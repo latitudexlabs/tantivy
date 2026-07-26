@@ -2,7 +2,7 @@ use crate::schema::Type;
 
 mod fast_field_range_doc_set;
 mod range_query;
-mod range_query_fastfield;
+pub(crate) mod range_query_fastfield;
 
 pub use common::bounds::BoundsRange;
 

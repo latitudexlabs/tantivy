@@ -17,27 +17,35 @@ use std::sync::Arc;
 ///
 /// # Ngram Optimization
 ///
-/// When ngram indexing is available, this query can be optimized to use ngram terms instead
-/// of position matching. For a query with terms [a, b, c, d], it generates ngrams for all
-/// ordered combinations:
-/// - Bigrams: ab, ac, ad, bc, bd, cd
-/// - Trigrams: abc, abd, acd, bcd
+/// When the field indexes word ngrams with `all_combinations` enabled, the
+/// query can be rewritten to a boolean SHOULD query over ngram terms,
+/// avoiding position matching entirely. Since a bigram proves 2 terms in
+/// order and a trigram proves 3, the rewrite only applies when:
+/// - `min_match == 2` and bigrams are indexed: for terms [a, b, c, d] the
+///   rewrite matches any of the bigrams ab, ac, ad, bc, bd, cd;
+/// - `min_match == 3` and trigrams are indexed: it matches any of the
+///   trigrams abc, abd, acd, bcd.
 ///
-/// A boolean SHOULD query matches documents containing any of these ngrams, avoiding
-/// expensive position intersection. This provides 10-60x speedup over position-based matching.
+/// Any other configuration falls back to position-based matching.
+///
+/// The rewrite is an approximation: ordered combinations are only indexed
+/// within the `all_combinations_window_size` window, so matches whose terms
+/// are further apart are not found. Use
+/// [`set_ngram_optimization_enabled(false)`](Self::set_ngram_optimization_enabled)
+/// to force exact position-based matching.
 ///
 /// # Fuzzy Term Matching
 ///
-/// When combined with ngram fields, you can enable fuzzy matching for individual terms
-/// based on their length. This allows matching documents with typos in the indexed terms.
-///
-/// For example, searching for "programming language features" with fuzzy matching enabled
-/// will also match documents containing "programing language features" (typo) if the
-/// ngrams are indexed with fuzzy variants.
+/// When combined with ngram fields, you can enable fuzzy matching based on
+/// term length. This allows matching documents with typos in the indexed
+/// terms: searching for "programming language features" will also match
+/// documents containing "programing language features".
 ///
 /// Use [`set_min_term_length_for_fuzzy`](Self::set_min_term_length_for_fuzzy) to enable
-/// fuzzy matching for terms above a minimum character length. This applies fuzzy matching
-/// to the ngram terms, allowing edit distance tolerance.
+/// fuzzy matching for terms above a minimum character length. Note that the
+/// edit distance applies to the ngram string as a whole (e.g.
+/// `"programming language"`), not to each word independently: one edit
+/// budget is shared across the words of an ngram.
 ///
 /// # Example with Fuzzy Ngrams
 ///
@@ -51,9 +59,10 @@ use std::sync::Arc;
 /// # fn main() -> tantivy::Result<()> {
 /// let mut schema_builder = Schema::builder();
 ///
-/// // Configure field with ngrams for optimization
+/// // Configure field with ngram combinations for optimization
 /// let ngram_config = WordNgramConfig::builder()
 ///     .ngram_types(WordNgramSet::new().with_ngram_ff().with_ngram_fr().with_ngram_rf())
+///     .all_combinations(true)
 ///     .build();
 ///
 /// let text_options = TextOptions::default()
@@ -78,7 +87,7 @@ use std::sync::Arc;
 ///     Term::from_field_text(text_field, "features"),
 /// ];
 ///
-/// let query = FuzzyPhraseQuery::new(terms, 3)
+/// let query = FuzzyPhraseQuery::new(terms, 2)
 ///     .set_min_term_length_for_fuzzy(5)      // Enable fuzzy for terms >= 5 chars
 ///     .set_fuzzy_distance(1)                  // Allow 1 edit distance
 ///     .set_fuzzy_transposition_cost_one(true);
@@ -106,6 +115,8 @@ pub struct FuzzyPhraseQuery {
     fuzzy_distance: u8,
     /// Whether transpositions cost 1 (true) or 2 (false)
     fuzzy_transposition_cost_one: bool,
+    /// Whether the ngram-based rewrite may be applied (default: true)
+    ngram_optimization_enabled: bool,
 }
 
 impl FuzzyPhraseQuery {
@@ -145,6 +156,7 @@ impl FuzzyPhraseQuery {
             min_term_length_for_fuzzy: 0, // No fuzzy matching by default
             fuzzy_distance: 1,
             fuzzy_transposition_cost_one: true,
+            ngram_optimization_enabled: true,
         }
     }
 
@@ -183,6 +195,16 @@ impl FuzzyPhraseQuery {
         self
     }
 
+    /// Enables or disables the ngram-based rewrite (default: enabled).
+    ///
+    /// The rewrite only finds matches whose terms co-occur within the
+    /// index-time `all_combinations` window; disable it to force exact,
+    /// position-based matching regardless of the field's ngram config.
+    pub fn set_ngram_optimization_enabled(mut self, enabled: bool) -> Self {
+        self.ngram_optimization_enabled = enabled;
+        self
+    }
+
     /// Returns the [`FuzzyPhraseWeight`] for the given fuzzy phrase query.
     pub(crate) fn fuzzy_phrase_weight(
         &self,
@@ -202,21 +224,30 @@ impl FuzzyPhraseQuery {
             )));
         }
 
-        let bm25_weight_opt = match enable_scoring {
+        // One Bm25Weight PER TERM: the scorer sums the weights of the terms
+        // present on a document, so rare matched terms outrank common ones.
+        // A single combined weight multiplied by match_count would give every
+        // document with the same match count an identical score (fieldnorms
+        // are often disabled on ngram fields), making ordering arbitrary.
+        let bm25_weights_opt = match enable_scoring {
             EnableScoring::Enabled {
                 statistics_provider,
                 ..
-            } => Some(Bm25Weight::for_terms(
-                statistics_provider,
-                &self.phrase_terms,
-            )?),
+            } => Some(
+                self.phrase_terms
+                    .iter()
+                    .map(|term| {
+                        Bm25Weight::for_terms(statistics_provider, std::slice::from_ref(term))
+                    })
+                    .collect::<crate::Result<Vec<_>>>()?,
+            ),
             EnableScoring::Disabled { .. } => None,
         };
 
         Ok(FuzzyPhraseWeight::new(
             Arc::clone(&self.phrase_terms),
             self.min_match,
-            bm25_weight_opt,
+            bm25_weights_opt,
         ))
     }
 }
@@ -227,19 +258,21 @@ impl Query for FuzzyPhraseQuery {
     /// See [`Weight`].
     fn weight(&self, enable_scoring: EnableScoring<'_>) -> crate::Result<Box<dyn Weight>> {
         // Try ngram optimization: generate all ordered combinations as ngram terms
-        let schema = enable_scoring.schema();
-        let optimizer = NgramQueryOptimizer::new(Arc::new(schema.clone()));
+        if self.ngram_optimization_enabled {
+            let schema = enable_scoring.schema();
+            let optimizer = NgramQueryOptimizer::new(Arc::new(schema.clone()));
 
-        if let Some(optimized_query) = optimizer.optimize_fuzzy_phrase_query(
-            self.field,
-            &self.phrase_terms,
-            enable_scoring.searcher(),
-            self.min_term_length_for_fuzzy,
-            self.fuzzy_distance,
-            self.fuzzy_transposition_cost_one,
-        ) {
-            // Use the optimized query (ngram-based boolean OR)
-            return optimized_query.weight(enable_scoring);
+            if let Some(optimized_query) = optimizer.optimize_fuzzy_phrase_query(
+                self.field,
+                &self.phrase_terms,
+                self.min_match,
+                self.min_term_length_for_fuzzy,
+                self.fuzzy_distance,
+                self.fuzzy_transposition_cost_one,
+            ) {
+                // Use the optimized query (ngram-based boolean OR)
+                return optimized_query.weight(enable_scoring);
+            }
         }
 
         // Fall back to regular fuzzy phrase query (position-based matching)
@@ -256,6 +289,49 @@ impl Query for FuzzyPhraseQuery {
 
 #[cfg(test)]
 mod tests {
+#[test]
+fn test_ngram_rewrite_scores_by_clause_idf() -> crate::Result<()> {
+    // The ngram rewrite produces one TermQuery clause per ordered pair; each
+    // clause must carry its own idf so a rare matched pair outscores a
+    // common one. Guards against doc_freq being stubbed out (a constant df
+    // makes every equal-match-count doc tie and order by docid).
+    use crate::collector::TopDocs;
+    use crate::query::FuzzyPhraseQuery;
+    use crate::schema::{Schema, TextFieldIndexing, TEXT, IndexRecordOption};
+    use crate::{Index, Term, WordNgramConfig, WordNgramSet, doc};
+
+    let text_indexing = TextFieldIndexing::default()
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+        .set_word_ngrams(
+            WordNgramConfig::with_set(WordNgramSet::new().with_ngram_ff())
+                .with_all_combinations()
+                .with_all_combinations_window_size(3),
+        );
+    let mut sb = Schema::builder();
+    let f = sb.add_text_field("text", TEXT.clone().set_indexing_options(text_indexing));
+    let schema = sb.build();
+    let index = Index::create_in_ram(schema);
+    let mut w = index.writer(15_000_000)?;
+    for _ in 0..50 {
+        w.add_document(doc!(f => "alpha beta filler"))?;
+    }
+    w.add_document(doc!(f => "gamma delta filler"))?;
+    w.commit()?;
+    let searcher = index.reader()?.searcher();
+
+    let common = FuzzyPhraseQuery::new(
+        vec![Term::from_field_text(f, "alpha"), Term::from_field_text(f, "beta")], 2);
+    let rare = FuzzyPhraseQuery::new(
+        vec![Term::from_field_text(f, "gamma"), Term::from_field_text(f, "delta")], 2);
+    let sc = searcher.search(&common, &TopDocs::with_limit(1).order_by_score())?[0].0;
+    let sr = searcher.search(&rare, &TopDocs::with_limit(1).order_by_score())?[0].0;
+    assert!(
+        sr > sc,
+        "rare pair must outscore common pair (idf), got rare={sr} common={sc}"
+    );
+    Ok(())
+}
+
     use super::*;
     use crate::schema::Schema;
     use crate::{Index, Term};
@@ -414,7 +490,7 @@ mod tests {
             &crate::collector::TopDocs::with_limit(10).order_by_score(),
         )?;
 
-        // All docs should match (all have at least 2 terms in order)
+        // The first three docs have at least 2 terms in order.
         assert_eq!(top_docs.len(), 3);
 
         let mut matched_texts: Vec<String> = top_docs
@@ -771,38 +847,6 @@ mod tests {
 
     #[test]
     fn test_fuzzy_phrase_with_ngram_optimization() -> crate::Result<()> {
-        use crate::indexer::WordNgramSet;
-        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
-        use crate::WordNgramConfig;
-
-        let mut schema_builder = Schema::builder();
-
-        // Create field with ngrams enabled for optimization
-        let ngram_config = WordNgramConfig::builder()
-            .ngram_types(
-                WordNgramSet::new()
-                    .with_ngram_ff()
-                    .with_ngram_fr()
-                    .with_ngram_rf()
-                    .with_ngram_fff()
-                    .with_ngram_ffr()
-                    .with_ngram_frf()
-                    .with_ngram_rff(),
-            )
-            .build();
-
-        let text_options = TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
-                    .set_word_ngrams(ngram_config),
-            )
-            .set_stored();
-
-        let text_field = schema_builder.add_text_field("text", text_options);
-        let schema = schema_builder.build();
-        let index = Index::create_in_ram(schema);
-
         // Index documents that match different ngram combinations
         let docs = vec![
             "the quick brown fox jumps over lazy dog",
@@ -811,24 +855,18 @@ mod tests {
             "the quick fox jumps",     // missing 'brown' - matches via ngrams
             "fox brown quick the",     // wrong order - shouldn't match
             "unrelated content here",  // no match
-            "the fox",
+            "the fox",                 // only 2 terms - must not satisfy min_match=3
         ];
-
-        let mut index_writer = index.writer(50_000_000)?;
-        for doc_text in &docs {
-            let mut doc = crate::schema::TantivyDocument::new();
-            doc.add_text(text_field, doc_text);
-            index_writer.add_document(doc)?;
-        }
-        index_writer.commit()?;
+        let index = create_combinations_ngram_index(&docs, true)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
 
         let reader = index.reader()?;
         let searcher = reader.searcher();
 
-        // Query for 4 terms, requiring at least 3 to match in order
-        // Generate forward-only ngram combinations:
-        // Bigrams: the-quick, the-brown, the-fox, quick-brown, quick-fox, brown-fox
-        // Trigrams: the-quick-brown, the-quick-fox, the-brown-fox, quick-brown-fox
+        // Query for 4 terms, requiring at least 3 to match in order.
+        // With min_match=3 the rewrite uses trigram combinations only:
+        // the-quick-brown, the-quick-fox, the-brown-fox, quick-brown-fox
         let terms = vec![
             Term::from_field_text(text_field, "the"),
             Term::from_field_text(text_field, "quick"),
@@ -842,8 +880,8 @@ mod tests {
             &crate::collector::TopDocs::with_limit(10).order_by_score(),
         )?;
 
-        // Should match first 5 documents (all have at least 3 terms in order)
-        assert_eq!(top_docs.len(), 5, "Expected 5 documents to match");
+        // The first four documents have at least 3 terms in order.
+        assert_eq!(top_docs.len(), 4, "Expected 4 documents to match");
 
         let mut matched_texts: Vec<String> = top_docs
             .iter()
@@ -855,9 +893,52 @@ mod tests {
         assert!(matched_texts.contains(&"the xyz brown fox jumps".to_string()));
         assert!(matched_texts.contains(&"quick brown fox".to_string()));
         assert!(matched_texts.contains(&"the quick fox jumps".to_string()));
-        assert!(matched_texts.contains(&"the fox".to_string()));
         assert!(!matched_texts.contains(&"fox brown quick the".to_string()));
         assert!(!matched_texts.contains(&"unrelated content here".to_string()));
+        // Only 2 of the 4 query terms: a bigram match must not satisfy
+        // min_match=3.
+        assert!(!matched_texts.contains(&"the fox".to_string()));
+
+        Ok(())
+    }
+
+    /// The ngram rewrite only finds matches within the all_combinations
+    /// window; disabling it must restore exact position-based matching.
+    #[test]
+    fn test_fuzzy_phrase_ngram_optimization_opt_out() -> crate::Result<()> {
+        // Gap wider than the default all_combinations window (100 tokens),
+        // so the "quick brown" bigram is not indexed.
+        let gap: String = (0..120).map(|i| format!("g{i} ")).collect();
+        let doc_text = format!("quick {gap}brown");
+        let docs = vec![doc_text.as_str()];
+        let index = create_combinations_ngram_index(&docs, false)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "quick"),
+            Term::from_field_text(text_field, "brown"),
+        ];
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+
+        // Documented approximation: the ngram rewrite misses the match.
+        let optimized_query = FuzzyPhraseQuery::new(terms.clone(), 2);
+        let top_docs = searcher.search(
+            &optimized_query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+        assert_eq!(top_docs.len(), 0);
+
+        // Opting out restores exact position-based matching.
+        let exact_query =
+            FuzzyPhraseQuery::new(terms, 2).set_ngram_optimization_enabled(false);
+        let top_docs = searcher.search(
+            &exact_query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+        assert_eq!(top_docs.len(), 1);
 
         Ok(())
     }
@@ -932,7 +1013,7 @@ mod tests {
         // Doc 0: no match (has "quick brown fox", not the edge terms)
         // Doc 1: has "qui bro fo" - all 3 edge terms match
         // Doc 2: has "quic brown fo" - 2 terms match (brown contains "bro", but we're looking for exact "bro" term)
-        assert!(top_docs.len() >= 1, "Expected at least 1 document to match");
+        assert!(!top_docs.is_empty(), "Expected at least 1 document to match");
 
         let mut matched_texts: Vec<String> = top_docs
             .iter()
@@ -1053,22 +1134,134 @@ mod tests {
         Ok(())
     }
 
+    /// A chain of `min_match` ordered terms must be found even when a
+    /// query term is present in the document at an out-of-order position.
+    /// Here `word1(0) -> word3(1) -> word4(2)` is a valid chain of 3;
+    /// `word2` appears after them and must be skipped, not consumed.
     #[test]
-    fn test_fuzzy_phrase_with_fuzzy_ngrams() -> crate::Result<()> {
+    fn test_fuzzy_phrase_chain_skips_out_of_order_term() -> crate::Result<()> {
+        let docs = vec!["word1 word3 word4 word2"];
+        let index = create_test_index(&docs)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "word1"),
+            Term::from_field_text(text_field, "word2"),
+            Term::from_field_text(text_field, "word3"),
+            Term::from_field_text(text_field, "word4"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 3);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+
+        assert_eq!(
+            top_docs.len(),
+            1,
+            "doc has 3 terms in order (word1 word3 word4) and should match"
+        );
+        Ok(())
+    }
+
+    /// A document matching more query terms in order must score higher than
+    /// one matching fewer, all else (doc length) being equal.
+    #[test]
+    fn test_fuzzy_phrase_score_reflects_match_count() -> crate::Result<()> {
+        // Same length, same first/last term; middle term differs.
+        let docs = vec!["apple banana cherry", "apple pear cherry"];
+        let index = create_test_index(&docs)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "apple"),
+            Term::from_field_text(text_field, "banana"),
+            Term::from_field_text(text_field, "cherry"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 2);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+        assert_eq!(top_docs.len(), 2);
+
+        let mut scores_by_text: std::collections::HashMap<String, f32> =
+            std::collections::HashMap::new();
+        for (score, addr) in &top_docs {
+            scores_by_text.insert(get_doc_text(&searcher, *addr, text_field), *score);
+        }
+        let full_match = scores_by_text["apple banana cherry"];
+        let partial_match = scores_by_text["apple pear cherry"];
+        assert!(
+            full_match > partial_match,
+            "3-term match ({full_match}) should outscore 2-term match ({partial_match})"
+        );
+        Ok(())
+    }
+
+    /// The scorer must report a non-zero size hint so query planners do not
+    /// treat it as an empty/free docset.
+    #[test]
+    fn test_fuzzy_phrase_scorer_size_hint_nonzero() -> crate::Result<()> {
+        use crate::docset::DocSet;
+        use crate::query::EnableScoring;
+
+        let docs = vec!["test1 test2", "test1 test2 test3", "test1 test2 extra"];
+        let index = create_test_index(&docs)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "test1"),
+            Term::from_field_text(text_field, "test2"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 2);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let weight = query.weight(EnableScoring::disabled_from_searcher(&searcher))?;
+        // The writer may spread the docs over several segments; every
+        // segment holds at least one doc with both terms, so every scorer
+        // must report a non-zero hint.
+        for segment_reader in searcher.segment_readers() {
+            let scorer = weight.scorer(segment_reader, 1.0)?;
+            assert!(scorer.size_hint() > 0);
+        }
+        Ok(())
+    }
+
+    /// Helper: index with word-ngram combinations enabled (bigrams and
+    /// optionally trigrams), using all_combinations mode.
+    fn create_combinations_ngram_index(
+        docs: &[&str],
+        with_trigrams: bool,
+    ) -> crate::Result<Index> {
         use crate::indexer::WordNgramSet;
         use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
         use crate::WordNgramConfig;
 
-        let mut schema_builder = Schema::builder();
-
-        // Create field with ngrams enabled
+        let mut ngram_set = WordNgramSet::new()
+            .with_ngram_ff()
+            .with_ngram_fr()
+            .with_ngram_rf();
+        if with_trigrams {
+            ngram_set = ngram_set
+                .with_ngram_fff()
+                .with_ngram_ffr()
+                .with_ngram_frf()
+                .with_ngram_rff();
+        }
         let ngram_config = WordNgramConfig::builder()
-            .ngram_types(
-                WordNgramSet::new()
-                    .with_ngram_ff()
-                    .with_ngram_fr()
-                    .with_ngram_rf(),
-            )
+            .ngram_types(ngram_set)
+            .all_combinations(true)
             .build();
 
         let text_options = TextOptions::default()
@@ -1079,26 +1272,171 @@ mod tests {
             )
             .set_stored();
 
+        let mut schema_builder = Schema::builder();
         let text_field = schema_builder.add_text_field("text", text_options);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
 
-        // Test documents with typos
-        let docs = vec![
-            "programming language features",
-            "programing language features",  // typo: missing 'm'
-            "programming languag features",  // typo: missing 'e'  
-            "programing languag features",   // typos in both words
-            "coding syntax tools",           // completely different words
-        ];
-
         let mut index_writer = index.writer(50_000_000)?;
-        for doc_text in &docs {
+        for doc_text in docs {
             let mut doc = crate::schema::TantivyDocument::new();
             doc.add_text(text_field, doc_text);
             index_writer.add_document(doc)?;
         }
         index_writer.commit()?;
+        Ok(index)
+    }
+
+    /// min_match must be honored by the ngram-optimized path: a document
+    /// containing only 2 of the query terms must not satisfy min_match=3
+    /// just because one bigram matches.
+    #[test]
+    fn test_fuzzy_phrase_ngram_min_match_not_satisfied_by_bigram() -> crate::Result<()> {
+        let docs = vec!["the fox", "the quick brown fox"];
+        let index = create_combinations_ngram_index(&docs, true)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "the"),
+            Term::from_field_text(text_field, "quick"),
+            Term::from_field_text(text_field, "brown"),
+            Term::from_field_text(text_field, "fox"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 3);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+
+        assert_eq!(top_docs.len(), 1, "only the 4-term doc has 3 terms in order");
+        let text = get_doc_text(&searcher, top_docs[0].1, text_field);
+        assert_eq!(text, "the quick brown fox");
+        Ok(())
+    }
+
+    /// min_match=1 cannot be expressed with bigrams; the query must fall
+    /// back to position matching so single-term documents still match.
+    #[test]
+    fn test_fuzzy_phrase_ngram_min_match_one_falls_back() -> crate::Result<()> {
+        let docs = vec!["programming only here", "nothing relevant"];
+        let index = create_combinations_ngram_index(&docs, false)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "programming"),
+            Term::from_field_text(text_field, "language"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 1);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+
+        assert_eq!(top_docs.len(), 1, "doc containing 'programming' must match");
+        Ok(())
+    }
+
+    /// The indexer never writes a bigram of two identical words, so a query
+    /// of repeated terms must not be rewritten into a dead ngram clause.
+    #[test]
+    fn test_fuzzy_phrase_ngram_duplicate_terms_fall_back() -> crate::Result<()> {
+        let docs = vec!["test gap test", "test only"];
+        let index = create_combinations_ngram_index(&docs, false)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "test"),
+            Term::from_field_text(text_field, "test"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 2);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+
+        assert_eq!(top_docs.len(), 1, "doc with two 'test' occurrences must match");
+        Ok(())
+    }
+
+    /// Without all_combinations, only adjacent ngrams are indexed, so the
+    /// rewrite cannot honor the "gaps allowed" contract and must fall back.
+    #[test]
+    fn test_fuzzy_phrase_consecutive_ngrams_fall_back_for_gaps() -> crate::Result<()> {
+        use crate::indexer::WordNgramSet;
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::WordNgramConfig;
+
+        // Consecutive-only ngram config (all_combinations defaults to false).
+        let ngram_config = WordNgramConfig::builder()
+            .ngram_types(
+                WordNgramSet::new()
+                    .with_ngram_ff()
+                    .with_ngram_fr()
+                    .with_ngram_rf(),
+            )
+            .build();
+        let text_options = TextOptions::default()
+            .set_indexing_options(
+                TextFieldIndexing::default()
+                    .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                    .set_word_ngrams(ngram_config),
+            )
+            .set_stored();
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", text_options);
+        let index = Index::create_in_ram(schema_builder.build());
+        let mut index_writer = index.writer(50_000_000)?;
+        let mut doc = crate::schema::TantivyDocument::new();
+        doc.add_text(text_field, "quick gap brown");
+        index_writer.add_document(doc)?;
+        index_writer.commit()?;
+
+        let terms = vec![
+            Term::from_field_text(text_field, "quick"),
+            Term::from_field_text(text_field, "brown"),
+        ];
+        let query = FuzzyPhraseQuery::new(terms, 2);
+
+        let reader = index.reader()?;
+        let searcher = reader.searcher();
+        let top_docs = searcher.search(
+            &query,
+            &crate::collector::TopDocs::with_limit(10).order_by_score(),
+        )?;
+
+        assert_eq!(
+            top_docs.len(),
+            1,
+            "'quick gap brown' has both terms in order and must match"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_fuzzy_phrase_with_fuzzy_ngrams() -> crate::Result<()> {
+        // Test documents with typos
+        let docs = vec![
+            "programming language features",
+            "programing language features", // typo: missing 'm'
+            "programming languag features", // typo: missing 'e'
+            "programing languag features",  // typos in both words
+            "coding syntax tools",          // completely different words
+        ];
+        let index = create_combinations_ngram_index(&docs, true)?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text")?;
 
         let reader = index.reader()?;
         let searcher = reader.searcher();
@@ -1109,10 +1447,10 @@ mod tests {
             Term::from_field_text(text_field, "language"),
             Term::from_field_text(text_field, "features"),
         ];
-        
+
         let query = FuzzyPhraseQuery::new(terms, 3)
-            .set_min_term_length_for_fuzzy(5)  // Apply fuzzy to all three terms
-            .set_fuzzy_distance(1)              // Allow 1 edit
+            .set_min_term_length_for_fuzzy(5) // Apply fuzzy to all three terms
+            .set_fuzzy_distance(1) // Allow 1 edit
             .set_fuzzy_transposition_cost_one(true);
 
         let top_docs = searcher.search(
@@ -1120,8 +1458,10 @@ mod tests {
             &crate::collector::TopDocs::with_limit(10).order_by_score(),
         )?;
 
-        // Should match docs with typos within edit distance
-        assert!(top_docs.len() >= 3, "Expected at least 3 matches, got {}", top_docs.len());
+        // Exact match plus the two single-typo docs. The edit distance
+        // applies to the trigram string as a whole, so the doc with a typo
+        // in two words (2 edits) must not match.
+        assert_eq!(top_docs.len(), 3, "Expected 3 matches");
 
         let mut matched_texts: Vec<String> = top_docs
             .iter()
@@ -1131,11 +1471,14 @@ mod tests {
 
         // Exact match
         assert!(matched_texts.contains(&"programming language features".to_string()));
-        
+
         // Single typo matches (within 1 edit distance)
         assert!(matched_texts.contains(&"programing language features".to_string()));
         assert!(matched_texts.contains(&"programming languag features".to_string()));
-        
+
+        // Two edits away from every query trigram
+        assert!(!matched_texts.contains(&"programing languag features".to_string()));
+
         // Completely different words should NOT match
         assert!(!matched_texts.contains(&"coding syntax tools".to_string()));
 

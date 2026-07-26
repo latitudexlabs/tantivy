@@ -37,6 +37,97 @@ pub(crate) mod tests {
         Ok(index)
     }
 
+    /// Helper: index with word-ngram bigrams enabled, in either consecutive
+    /// or all_combinations mode, for exercising the ngram rewrite path.
+    fn create_ngram_index<S: AsRef<str>>(
+        texts: &[S],
+        all_combinations: bool,
+    ) -> crate::Result<Index> {
+        use crate::indexer::WordNgramSet;
+        use crate::schema::{IndexRecordOption, TextFieldIndexing, TextOptions};
+        use crate::WordNgramConfig;
+
+        let ngram_config = WordNgramConfig::builder()
+            .ngram_types(
+                WordNgramSet::new()
+                    .with_ngram_ff()
+                    .with_ngram_fr()
+                    .with_ngram_rf(),
+            )
+            .all_combinations(all_combinations)
+            .build();
+        let text_options = TextOptions::default().set_indexing_options(
+            TextFieldIndexing::default()
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+                .set_word_ngrams(ngram_config),
+        );
+        let mut schema_builder = Schema::builder();
+        let text_field = schema_builder.add_text_field("text", text_options);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer: IndexWriter = index.writer_for_tests()?;
+            for text in texts {
+                index_writer.add_document(doc!(text_field=>text.as_ref()))?;
+            }
+            index_writer.commit()?;
+        }
+        Ok(index)
+    }
+
+    fn search_phrase(index: &Index, texts: &[&str]) -> Vec<DocId> {
+        let text_field = index.schema().get_field("text").unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let terms: Vec<Term> = texts
+            .iter()
+            .map(|text| Term::from_field_text(text_field, text))
+            .collect();
+        let phrase_query = PhraseQuery::new(terms);
+        searcher
+            .search(&phrase_query, &TEST_COLLECTOR_WITHOUT_SCORE)
+            .unwrap()
+            .docs()
+            .iter()
+            .map(|docaddr| docaddr.doc_id)
+            .collect()
+    }
+
+    /// Bigram co-occurrence is necessary but not sufficient for a phrase
+    /// match: "a b x b c" contains bigrams "a b" and "b c" but not the
+    /// phrase "a b c". The ngram rewrite must not produce false positives.
+    #[test]
+    pub fn test_phrase_ngram_rewrite_no_false_positive() -> crate::Result<()> {
+        let index = create_ngram_index(&["a b x b c", "a b c"], false)?;
+        assert_eq!(search_phrase(&index, &["a", "b", "c"]), vec![1]);
+        Ok(())
+    }
+
+    /// Non-adjacent repeated query terms: "x no x" contains bigrams
+    /// "x no" and "no x" but not the phrase "no x no".
+    #[test]
+    pub fn test_phrase_ngram_rewrite_non_adjacent_repeated_terms() -> crate::Result<()> {
+        let index = create_ngram_index(&["x no x", "no x no"], false)?;
+        assert_eq!(search_phrase(&index, &["no", "x", "no"]), vec![1]);
+        Ok(())
+    }
+
+    /// In all_combinations mode, a bigram is indexed for any in-window
+    /// ordered pair, so its presence no longer implies adjacency. The
+    /// exact-phrase semantics must still hold.
+    #[test]
+    pub fn test_phrase_ngram_rewrite_all_combinations_no_false_positive() -> crate::Result<()> {
+        let index = create_ngram_index(&["a gap b", "a b"], true)?;
+        assert_eq!(search_phrase(&index, &["a", "b"]), vec![1]);
+        Ok(())
+    }
+
+    /// Control: true phrase matches on an ngram-enabled field still match.
+    #[test]
+    pub fn test_phrase_ngram_rewrite_true_positive() -> crate::Result<()> {
+        let index = create_ngram_index(&["a b c", "c b a"], false)?;
+        assert_eq!(search_phrase(&index, &["a", "b", "c"]), vec![0]);
+        Ok(())
+    }
+
     #[test]
     pub fn test_phrase_query() -> crate::Result<()> {
         let index = create_index(&[

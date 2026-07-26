@@ -171,7 +171,7 @@ pub struct WordNgramConfig {
     /// **Performance:** Optimized to only generate combinations with the newest token
     /// in the sliding window, reducing computational overhead significantly.
     /// 
-    /// **Window size:** Controlled by `all_combinations_window_size` (default: 5)
+    /// **Window size:** Controlled by `all_combinations_window_size` (default: 100)
     /// 
     /// Default: false
     #[serde(default)]
@@ -192,7 +192,7 @@ pub struct WordNgramConfig {
     /// - N=5: 4 bigrams + 6 trigrams = 10 combinations per token
     /// - N=10: 9 bigrams + 36 trigrams = 45 combinations per token
     /// 
-    /// Default: 5 (good balance between coverage and performance)
+    /// Default: 100
     #[serde(default = "default_all_combinations_window_size")]
     pub all_combinations_window_size: usize,
     
@@ -229,6 +229,22 @@ pub struct WordNgramConfig {
     /// Default: 2
     #[serde(default = "default_min_edge_ngram")]
     pub min_edge_ngram: usize,
+
+    /// Also index each token's edge ngrams as standalone (unigram) terms
+    /// 
+    /// `edge_ngram` alone only embeds prefixes inside bigram/trigram
+    /// combination terms, so a single-word prefix ("berw") has no term to
+    /// match. With this enabled, every prefix of a token from
+    /// `min_edge_ngram` up to its full length (exclusive) is additionally
+    /// indexed as its own term **at the token's position**, so both plain
+    /// term lookups and position-based phrase matching work on partially
+    /// typed words.
+    /// 
+    /// Requires `edge_ngram` to be enabled; shares `min_edge_ngram`.
+    /// 
+    /// Default: false
+    #[serde(default)]
+    pub unigram_edge_ngram: bool,
 }
 
 fn default_frequent_threshold() -> f32 {
@@ -257,6 +273,7 @@ impl Default for WordNgramConfig {
             all_combinations_window_size: default_all_combinations_window_size(),
             edge_ngram: false,
             min_edge_ngram: default_min_edge_ngram(),
+            unigram_edge_ngram: false,
         }
     }
 }
@@ -318,6 +335,13 @@ impl WordNgramConfig {
     /// generated from this length up to the full token length.
     pub fn with_min_edge_ngram(mut self, min_length: usize) -> Self {
         self.min_edge_ngram = min_length;
+        self
+    }
+
+    /// Also index each token's edge ngrams as standalone terms at the
+    /// token's position (see [`WordNgramConfig::unigram_edge_ngram`]).
+    pub fn with_unigram_edge_ngram(mut self) -> Self {
+        self.unigram_edge_ngram = true;
         self
     }
     
@@ -403,6 +427,7 @@ pub struct WordNgramConfigBuilder {
     all_combinations_window_size: Option<usize>,
     edge_ngram: bool,
     min_edge_ngram: Option<usize>,
+    unigram_edge_ngram: bool,
 }
 
 impl WordNgramConfigBuilder {
@@ -448,6 +473,12 @@ impl WordNgramConfigBuilder {
         self
     }
     
+    /// Also index each token's edge ngrams as standalone terms
+    pub fn unigram_edge_ngram(mut self, enabled: bool) -> Self {
+        self.unigram_edge_ngram = enabled;
+        self
+    }
+    
     /// Build the configuration
     pub fn build(self) -> WordNgramConfig {
         WordNgramConfig {
@@ -458,6 +489,7 @@ impl WordNgramConfigBuilder {
             all_combinations_window_size: self.all_combinations_window_size.unwrap_or_else(default_all_combinations_window_size),
             edge_ngram: self.edge_ngram,
             min_edge_ngram: self.min_edge_ngram.unwrap_or_else(default_min_edge_ngram),
+            unigram_edge_ngram: self.unigram_edge_ngram,
         }
     }
 }
@@ -543,6 +575,21 @@ mod tests {
         assert_eq!(config.min_edge_ngram, 2);
         assert!(config.all_combinations);
         assert_eq!(config.all_combinations_window_size, 7);
+    }
+
+    #[test]
+    fn test_unigram_edge_ngram_deserializes_absent_as_false() {
+        // Configs serialized before the field existed must load unchanged.
+        let json = r#"{"ngram_set":{"bits":1},"all_combinations":true,"edge_ngram":true,"min_edge_ngram":3}"#;
+        let config: WordNgramConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.unigram_edge_ngram);
+        assert!(config.edge_ngram);
+
+        let config = WordNgramConfig::with_set(WordNgramSet::new().with_ngram_ff())
+            .with_unigram_edge_ngram();
+        let round: WordNgramConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(round.unigram_edge_ngram);
     }
 
     #[test]
