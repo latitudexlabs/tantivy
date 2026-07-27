@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use columnar::{
     BytesColumn, Column, ColumnType, ColumnValues, ColumnarReader, DynamicColumn,
@@ -14,6 +15,45 @@ use crate::schema::{Field, FieldEntry, FieldType, Schema};
 use crate::space_usage::{FieldUsage, PerFieldSpaceUsage};
 use crate::TantivyError;
 
+/// Memoizes the per-segment fast field lookups that are pure functions of the
+/// (immutable) columnar file and schema.
+///
+/// Resolving a fast field goes through three steps, and *every* one of them was
+/// repeated on every query touching that field:
+///  1. `resolve_field` + `ColumnarReader::read_columns` — an sstable lookup
+///     yielding the column handles for a field name.
+///  2. `DynamicColumnHandle::open` — parses the column header and materializes
+///     the column index. For a blockwise-linear index this rebuilds the whole
+///     per-block metadata vector, which dominated the cost.
+///  3. the same, through the `u64`-lenient view used by range queries.
+///
+/// A segment's columnar data never changes once opened, so the results are
+/// stable and safe to keep. Cached values (`DynamicColumnHandle`, `DynamicColumn`,
+/// `Column<u64>`) are all cheap `Arc`/`OwnedBytes` clones, so a hit costs a lock
+/// plus a refcount bump instead of a re-parse.
+///
+/// "This field has no column of that type" is cached as `None` — that is bounded
+/// by the segment's own fields. A field name that resolves to *no* column at all
+/// is deliberately NOT cached: field names come from the caller (and under the
+/// quickwit `_dynamic` field every string resolves), so memoizing misses would
+/// let an unbounded set of arbitrary names accumulate.
+///
+/// Memory is therefore bounded by the number of distinct (field, column type)
+/// pairs that actually exist and are queried on the segment. Those columns are
+/// kept alive for the lifetime of the `SegmentReader`, which is exactly the
+/// lifetime a long-lived searcher wants them for.
+///
+/// The maps are keyed by the *user-supplied* field name (not the resolved column
+/// name) so that a hit also skips `resolve_field`. They are nested rather than
+/// keyed on a `(String, ColumnType)` tuple so lookups can borrow the name and
+/// avoid allocating on the hit path.
+#[derive(Default)]
+struct ColumnCache {
+    handles: RwLock<HashMap<String, Arc<Vec<DynamicColumnHandle>>>>,
+    opened: RwLock<HashMap<String, HashMap<ColumnType, Option<DynamicColumn>>>>,
+    lenient: RwLock<HashMap<String, HashMap<ColumnType, Option<Column<u64>>>>>,
+}
+
 /// Provides access to all of the BitpackedFastFieldReader.
 ///
 /// Internally, `FastFieldReaders` have preloaded fast field readers,
@@ -22,12 +62,129 @@ use crate::TantivyError;
 pub struct FastFieldReaders {
     columnar: Arc<ColumnarReader>,
     schema: Schema,
+    /// Shared with every clone: clones of a `FastFieldReaders` address the same
+    /// immutable segment, so they should share the memoized columns rather than
+    /// each re-opening them.
+    cache: Arc<ColumnCache>,
 }
 
 impl FastFieldReaders {
     pub(crate) fn open(fast_field_file: FileSlice, schema: Schema) -> io::Result<FastFieldReaders> {
         let columnar = Arc::new(ColumnarReader::open(fast_field_file)?);
-        Ok(FastFieldReaders { columnar, schema })
+        Ok(FastFieldReaders {
+            columnar,
+            schema,
+            cache: Arc::new(ColumnCache::default()),
+        })
+    }
+
+    /// Column handles for `field_name`, memoized (step 1 above).
+    ///
+    /// A field that resolves to no column is *not* cached (see [`ColumnCache`]),
+    /// and an *invalid* field (e.g. not configured as fast) keeps returning its
+    /// error uncached, since that is a caller bug rather than a property of the
+    /// segment.
+    fn cached_column_handles(
+        &self,
+        field_name: &str,
+    ) -> crate::Result<Arc<Vec<DynamicColumnHandle>>> {
+        if let Some(handles) = self
+            .cache
+            .handles
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(field_name)
+        {
+            return Ok(Arc::clone(handles));
+        }
+        let handles: Vec<DynamicColumnHandle> = match self.resolve_field(field_name)? {
+            Some(resolved_field_name) => self.columnar.read_columns(&resolved_field_name)?,
+            None => Vec::new(),
+        };
+        let handles = Arc::new(handles);
+        // Only names that actually map to a column are cached. Field names come
+        // from the caller (and with quickwit's `_dynamic` field *every* string
+        // resolves), so caching misses would let an unbounded set of arbitrary
+        // names accumulate for the lifetime of the segment reader. Columns that
+        // exist are bounded by the segment itself.
+        if !handles.is_empty() {
+            self.cache
+                .handles
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(field_name.to_string(), Arc::clone(&handles));
+        }
+        Ok(handles)
+    }
+
+    /// The opened column of type `column_type` for `field_name`, memoized
+    /// (step 2 above).
+    fn cached_dynamic_column(
+        &self,
+        field_name: &str,
+        column_type: ColumnType,
+    ) -> crate::Result<Option<DynamicColumn>> {
+        if let Some(column) = self
+            .cache
+            .opened
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(field_name)
+            .and_then(|by_type| by_type.get(&column_type))
+        {
+            return Ok(column.clone());
+        }
+        let handles = self.cached_column_handles(field_name)?;
+        if handles.is_empty() {
+            // Unknown field: nothing to memoize, and caching it would let
+            // arbitrary caller-supplied names accumulate (see
+            // `cached_column_handles`).
+            return Ok(None);
+        }
+        let column_opt: Option<DynamicColumn> = handles
+            .iter()
+            .find(|column| column.column_type() == column_type)
+            .map(|column| column.open())
+            .transpose()?;
+        // A `None` here means "this field has no column of this type" — bounded
+        // by the segment's own fields, so it is worth remembering.
+        self.cache
+            .opened
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(field_name.to_string())
+            .or_default()
+            .insert(column_type, column_opt.clone());
+        Ok(column_opt)
+    }
+
+    /// The `u64`-lenient view of the `column_type` column of `field_name`,
+    /// memoized (step 3 above). This is the view range queries run on.
+    fn cached_u64_lenient_column(
+        &self,
+        field_name: &str,
+        handle: &DynamicColumnHandle,
+    ) -> crate::Result<Option<Column<u64>>> {
+        let column_type = handle.column_type();
+        if let Some(column) = self
+            .cache
+            .lenient
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(field_name)
+            .and_then(|by_type| by_type.get(&column_type))
+        {
+            return Ok(column.clone());
+        }
+        let column_opt = handle.open_u64_lenient()?;
+        self.cache
+            .lenient
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(field_name.to_string())
+            .or_default()
+            .insert(column_type, column_opt.clone());
+        Ok(column_opt)
     }
 
     fn resolve_field(&self, column_name: &str) -> crate::Result<Option<String>> {
@@ -116,12 +273,9 @@ impl FastFieldReaders {
         T: HasAssociatedColumnType,
         DynamicColumn: Into<Option<Column<T>>>,
     {
-        let Some(dynamic_column_handle) =
-            self.dynamic_column_handle(field_name, T::column_type())?
-        else {
+        let Some(dynamic_column) = self.cached_dynamic_column(field_name, T::column_type())? else {
             return Ok(None);
         };
-        let dynamic_column = dynamic_column_handle.open()?;
         Ok(dynamic_column.into())
     }
 
@@ -129,13 +283,9 @@ impl FastFieldReaders {
     ///
     /// Returns 0 if the column does not exist.
     pub fn column_num_bytes(&self, field: &str) -> crate::Result<ByteCount> {
-        let Some(resolved_field_name) = self.resolve_field(field)? else {
-            return Ok(0u64.into());
-        };
         Ok(self
-            .columnar
-            .read_columns(&resolved_field_name)?
-            .into_iter()
+            .cached_column_handles(field)?
+            .iter()
             .map(|column_handle| column_handle.num_bytes())
             .sum())
     }
@@ -193,23 +343,17 @@ impl FastFieldReaders {
 
     /// Returns a `str` column.
     pub fn str(&self, field_name: &str) -> crate::Result<Option<StrColumn>> {
-        let Some(dynamic_column_handle) =
-            self.dynamic_column_handle(field_name, ColumnType::Str)?
-        else {
+        let Some(dynamic_column) = self.cached_dynamic_column(field_name, ColumnType::Str)? else {
             return Ok(None);
         };
-        let dynamic_column = dynamic_column_handle.open()?;
         Ok(dynamic_column.into())
     }
 
     /// Returns a `bytes` column.
     pub fn bytes(&self, field_name: &str) -> crate::Result<Option<BytesColumn>> {
-        let Some(dynamic_column_handle) =
-            self.dynamic_column_handle(field_name, ColumnType::Bytes)?
-        else {
+        let Some(dynamic_column) = self.cached_dynamic_column(field_name, ColumnType::Bytes)? else {
             return Ok(None);
         };
-        let dynamic_column = dynamic_column_handle.open()?;
         Ok(dynamic_column.into())
     }
 
@@ -219,14 +363,11 @@ impl FastFieldReaders {
         field_name: &str,
         column_type: ColumnType,
     ) -> crate::Result<Option<DynamicColumnHandle>> {
-        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
-            return Ok(None);
-        };
         let dynamic_column_handle_opt = self
-            .columnar
-            .read_columns(&resolved_field_name)?
-            .into_iter()
-            .find(|column| column.column_type() == column_type);
+            .cached_column_handles(field_name)?
+            .iter()
+            .find(|column| column.column_type() == column_type)
+            .cloned();
         Ok(dynamic_column_handle_opt)
     }
 
@@ -235,15 +376,7 @@ impl FastFieldReaders {
         &self,
         field_name: &str,
     ) -> crate::Result<Vec<DynamicColumnHandle>> {
-        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
-            return Ok(Vec::new());
-        };
-        let dynamic_column_handles = self
-            .columnar
-            .read_columns(&resolved_field_name)?
-            .into_iter()
-            .collect();
-        Ok(dynamic_column_handles)
+        Ok(self.cached_column_handles(field_name)?.as_ref().clone())
     }
 
     /// Returns all `dynamic_column_handle` that are inner fields of the provided JSON path.
@@ -302,16 +435,15 @@ impl FastFieldReaders {
         type_white_list_opt: Option<&[ColumnType]>,
         field_name: &str,
     ) -> crate::Result<Option<(Column<u64>, ColumnType)>> {
-        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
-            return Ok(None);
-        };
-        for col in self.columnar.read_columns(&resolved_field_name)? {
+        for col in self.cached_column_handles(field_name)?.iter() {
             if let Some(type_white_list) = type_white_list_opt {
                 if !type_white_list.contains(&col.column_type()) {
                     continue;
                 }
             }
-            if let Some(col_u64) = col.open_u64_lenient()? {
+            // Only whitelisted columns are opened, exactly as before — the cache
+            // is consulted per column, so filtering semantics are unchanged.
+            if let Some(col_u64) = self.cached_u64_lenient_column(field_name, col)? {
                 return Ok(Some((col_u64, col.column_type())));
             }
         }
@@ -330,16 +462,13 @@ impl FastFieldReaders {
         field_name: &str,
     ) -> crate::Result<Vec<(Column<u64>, ColumnType)>> {
         let mut columns_and_types = Vec::new();
-        let Some(resolved_field_name) = self.resolve_field(field_name)? else {
-            return Ok(columns_and_types);
-        };
-        for col in self.columnar.read_columns(&resolved_field_name)? {
+        for col in self.cached_column_handles(field_name)?.iter() {
             if let Some(type_white_list) = type_white_list_opt {
                 if !type_white_list.contains(&col.column_type()) {
                     continue;
                 }
             }
-            if let Some(col_u64) = col.open_u64_lenient()? {
+            if let Some(col_u64) = self.cached_u64_lenient_column(field_name, col)? {
                 columns_and_types.push((col_u64, col.column_type()));
             }
         }
@@ -381,6 +510,8 @@ impl FastFieldReaders {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use columnar::ColumnType;
 
     use crate::schema::{JsonObjectOptions, Schema, FAST};
@@ -513,5 +644,197 @@ mod tests {
             .dynamic_subpath_column_handles("json.foo")
             .unwrap();
         assert_eq!(foo_subcolumns.len(), 0);
+    }
+
+    /// A segment with one u64, one f64 and a polymorphic json fast field —
+    /// mirrors the shape the column cache has to serve (typed lookups plus the
+    /// `u64`-lenient views that range queries use).
+    fn cache_test_index() -> Index {
+        let mut schema_builder = Schema::builder();
+        let id = schema_builder.add_u64_field("id", FAST);
+        let id2 = schema_builder.add_u64_field("id2", FAST);
+        let score = schema_builder.add_f64_field("score", FAST);
+        let json = schema_builder.add_json_field("json", FAST);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(
+                doc!(id => 1u64, id2 => 10u64, score => 1.5f64, json => json!({"foo": 42})),
+            )
+            .unwrap();
+        index_writer
+            .add_document(
+                doc!(id => 2u64, id2 => 20u64, score => 2.5f64, json => json!({"foo": "bar"})),
+            )
+            .unwrap();
+        index_writer.commit().unwrap();
+        index
+    }
+
+    #[test]
+    fn test_column_cache_memoizes_opened_columns() {
+        // The point of the cache: opening the same column twice must not
+        // re-parse it. Identity (not just equality) of the underlying values
+        // is what proves the second call was served from the cache.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        let first = fast_fields.u64("id").unwrap();
+        let second = fast_fields.u64("id").unwrap();
+        assert!(
+            Arc::ptr_eq(&first.values, &second.values),
+            "repeated u64 opens must share one parsed column"
+        );
+
+        let first_f64 = fast_fields.f64("score").unwrap();
+        let second_f64 = fast_fields.f64("score").unwrap();
+        assert!(
+            Arc::ptr_eq(&first_f64.values, &second_f64.values),
+            "repeated f64 opens must share one parsed column"
+        );
+
+        // Distinct fields of the same type must stay distinct — the cache is
+        // keyed per field, not a single shared slot.
+        let other_u64 = fast_fields.u64("id2").unwrap();
+        assert!(
+            !Arc::ptr_eq(&first.values, &other_u64.values),
+            "different fields must not collide in the cache"
+        );
+    }
+
+    #[test]
+    fn test_column_cache_preserves_values() {
+        // Caching must not change what the columns read back.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        for _ in 0..3 {
+            let ids = fast_fields.u64("id").unwrap();
+            assert_eq!(ids.first(0).unwrap(), 1u64);
+            assert_eq!(ids.first(1).unwrap(), 2u64);
+            let scores = fast_fields.f64("score").unwrap();
+            assert_eq!(scores.first(0).unwrap(), 1.5f64);
+            assert_eq!(scores.first(1).unwrap(), 2.5f64);
+        }
+    }
+
+    #[test]
+    fn test_column_cache_memoizes_u64_lenient_columns() {
+        // The path range queries take (`u64_lenient_for_type`) is cached too —
+        // this was the dominant cost in the geocode profile.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        let (first, first_type) = fast_fields.u64_lenient_for_type(None, "id").unwrap().unwrap();
+        let (second, second_type) = fast_fields.u64_lenient_for_type(None, "id").unwrap().unwrap();
+        assert_eq!(first_type, ColumnType::U64);
+        assert_eq!(second_type, ColumnType::U64);
+        assert!(
+            Arc::ptr_eq(&first.values, &second.values),
+            "repeated lenient opens must share one parsed column"
+        );
+    }
+
+    #[test]
+    fn test_column_cache_preserves_type_whitelist_semantics() {
+        // A json field carries several typed columns for one path. The cache is
+        // consulted per column, so a whitelist must still select exactly the
+        // requested type — and never open a non-whitelisted one.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        for _ in 0..2 {
+            let (_, col_type) = fast_fields
+                .u64_lenient_for_type(Some(&[ColumnType::Str]), "json.foo")
+                .unwrap()
+                .expect("json.foo has a str column");
+            assert_eq!(col_type, ColumnType::Str);
+
+            let (_, col_type) = fast_fields
+                .u64_lenient_for_type(Some(&[ColumnType::I64]), "json.foo")
+                .unwrap()
+                .expect("json.foo has an i64 column");
+            assert_eq!(col_type, ColumnType::I64);
+
+            assert!(
+                fast_fields
+                    .u64_lenient_for_type(Some(&[ColumnType::Bool]), "json.foo")
+                    .unwrap()
+                    .is_none(),
+                "no bool column was indexed for json.foo"
+            );
+        }
+    }
+
+    #[test]
+    fn test_column_cache_caches_missing_columns() {
+        // Negative lookups are cached as `None`; they must keep reporting
+        // absence rather than erroring or resurrecting a column.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        for _ in 0..3 {
+            assert!(fast_fields
+                .column_opt::<u64>("does_not_exist")
+                .unwrap()
+                .is_none());
+            // Present field, wrong type: also a cached negative.
+            assert!(fast_fields.column_opt::<i64>("id").unwrap().is_none());
+        }
+        // ...and the real column is still reachable afterwards.
+        assert_eq!(fast_fields.u64("id").unwrap().first(0).unwrap(), 1u64);
+    }
+
+    #[test]
+    fn test_column_cache_does_not_cache_errors() {
+        // A field that exists in the schema but is not FAST is a caller error,
+        // not a property of the segment: it must keep erroring on every call
+        // rather than being memoized (as a `None` or otherwise).
+        let mut schema_builder = Schema::builder();
+        let id = schema_builder.add_u64_field("id", FAST);
+        let text = schema_builder.add_text_field("text", crate::schema::TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(id => 1u64, text => "hello"))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        for _ in 0..3 {
+            assert!(
+                fast_fields.column_opt::<u64>("text").is_err(),
+                "a non-fast field must keep reporting the error"
+            );
+        }
+        assert_eq!(fast_fields.u64("id").unwrap().first(0).unwrap(), 1u64);
+    }
+
+    #[test]
+    fn test_column_cache_column_num_bytes() {
+        // `column_num_bytes` was rewired onto the handle cache; a present field
+        // still reports its size and an absent one still reports 0.
+        let index = cache_test_index();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        for _ in 0..2 {
+            assert!(fast_fields.column_num_bytes("id").unwrap().get_bytes() > 0);
+            assert_eq!(
+                fast_fields
+                    .column_num_bytes("does_not_exist")
+                    .unwrap()
+                    .get_bytes(),
+                0u64
+            );
+        }
     }
 }
