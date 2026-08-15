@@ -197,6 +197,9 @@ pub struct TextFieldIndexing {
     fieldnorms: bool,
     #[serde(default = "default_tokenizer")]
     tokenizer: Cow<'static, str>,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    word_ngrams: Option<WordNgramConfig>,
 }
 
 fn default_tokenizer() -> Cow<'static, str> {
@@ -253,6 +256,11 @@ impl TextFieldIndexing {
     }
 
     /// Returns the indexing options associated with this field.
+    ///
+    /// See [`IndexRecordOption`] for more detail.
+    pub fn index_option(&self) -> IndexRecordOption {
+        self.record
+    }
 
     /// Sets the word ngram indexing configuration for faster phrase search.
     ///
@@ -282,11 +290,6 @@ impl TextFieldIndexing {
     /// Returns the word ngram configuration if set.
     pub fn word_ngrams(&self) -> Option<&WordNgramConfig> {
         self.word_ngrams.as_ref()
-    }
-    ///
-    /// See [`IndexRecordOption`] for more detail.
-    pub fn index_option(&self) -> IndexRecordOption {
-        self.record
     }
 }
 

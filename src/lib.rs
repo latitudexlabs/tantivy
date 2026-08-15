@@ -230,7 +230,10 @@ pub use crate::index::{
     Index, IndexBuilder, IndexMeta, IndexSettings, IndexSortByField, InvertedIndexReader, Order,
     Segment, SegmentMeta, SegmentReader,
 };
-pub use crate::indexer::{IndexWriter, SingleSegmentIndexWriter};
+pub use crate::indexer::{
+    FrequentTermTracker, IndexWriter, NgramType, SingleSegmentIndexWriter, WordNgramConfig,
+    WordNgramConfigBuilder, WordNgramSet,
+};
 pub use crate::plugin::{PluginMergeContext, PluginWriter, PluginWriterContext, SegmentPlugin};
 pub use crate::schema::{Document, TantivyDocument, Term};
 

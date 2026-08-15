@@ -278,7 +278,7 @@ impl NgramQueryOptimizer {
 
     /// Returns the word ngram config of `field` if it is an ngram-enabled
     /// text field.
-    fn ngram_config(&self, field: Field) -> Option<&crate::WordNgramConfig> {
+    fn ngram_config(&self, field: Field) -> Option<&crate::indexer::WordNgramConfig> {
         let field_entry = self.schema.get_field_entry(field);
         let text_options = match field_entry.field_type() {
             FieldType::Str(options) => options,

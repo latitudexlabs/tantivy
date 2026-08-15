@@ -74,10 +74,13 @@ mod tests_mmap {
     use crate::aggregation::AggregationCollector;
     use crate::collector::{Count, TopDocs};
     use crate::index::FieldMetadata;
-    use crate::query::{AllQuery, QueryParser};
-    use crate::schema::{JsonObjectOptions, Schema, Type, FAST, INDEXED, STORED, TEXT};
+    use crate::query::{AllQuery, PhrasePrefixQuery, PhraseQuery, QueryParser, TermQuery};
+    use crate::schema::{
+        IndexRecordOption, JsonObjectOptions, Schema, TextFieldIndexing, TextOptions, Type, FAST,
+        INDEXED, STORED, TEXT,
+    };
     use crate::tokenizer::RAW_TOKENIZER_NAME;
-    use crate::{Index, IndexWriter, Term};
+    use crate::{Index, IndexWriter, Term, WordNgramConfig, WordNgramSet};
 
     #[test]
     fn test_advance_delete_bug() -> crate::Result<()> {
