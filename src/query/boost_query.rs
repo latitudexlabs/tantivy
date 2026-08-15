@@ -16,6 +16,16 @@ pub struct BoostQuery {
 }
 
 impl BoostQuery {
+    /// The wrapped query, cloned out of the boost wrapper.
+    pub fn underlying_query(&self) -> Box<dyn Query> {
+        self.query.box_clone()
+    }
+
+    /// Get the boost score.
+    pub fn get_boost(&self) -> Score {
+        self.boost
+    }
+
     /// Builds a boost query.
     pub fn new(query: Box<dyn Query>, boost: Score) -> BoostQuery {
         BoostQuery { query, boost }

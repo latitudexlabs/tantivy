@@ -268,6 +268,11 @@ pub struct FuzzyTermQuery {
 }
 
 impl FuzzyTermQuery {
+    /// The term being searched for.
+    pub fn term(&self) -> &Term {
+        &self.term
+    }
+
     /// Creates a new Fuzzy Query
     pub fn new(term: Term, distance: u8, transposition_cost_one: bool) -> FuzzyTermQuery {
         FuzzyTermQuery {

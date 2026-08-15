@@ -47,6 +47,11 @@ use self::termdict::{
     TermStreamerBuilder, TermWithStateStreamerBuilder,
 };
 pub use self::termdict::{TermMerger, TermStreamer, TermWithStateStreamer};
+// Exposed for consumers that read a term-info store slice directly rather than
+// opening a whole term dictionary. Not available under `quickwit`, which uses the
+// sstable term dictionary instead.
+#[cfg(not(feature = "quickwit"))]
+pub use fst_termdict::TermInfoStore;
 use crate::postings::TermInfo;
 
 #[derive(Debug, Eq, PartialEq)]
