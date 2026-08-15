@@ -193,7 +193,7 @@ fn index_documents<D: Document>(
         }
         let mem_usage = segment_writer.mem_usage();
         if mem_usage >= memory_budget - MARGIN_IN_BYTES {
-            info!(
+            debug!(
                 "Buffer limit reached, flushing segment with maxdoc={}.",
                 segment_writer.max_doc()
             );
@@ -278,10 +278,11 @@ impl<D: Document> IndexWriter<D> {
     /// If the memory arena per thread is too small or too big, returns
     /// `TantivyError::InvalidArgument`
     pub(crate) fn new(
-        index: &Index,
+        index: Index,
         options: IndexWriterOptions,
         directory_lock: DirectoryLock,
     ) -> crate::Result<Self> {
+        index.validate_plugins()?;
         if options.memory_budget_per_thread < MEMORY_BUDGET_NUM_BYTES_MIN {
             let err_msg = format!(
                 "The memory arena in bytes per thread needs to be at least \
@@ -562,7 +563,7 @@ impl<D: Document> IndexWriter<D> {
     ///
     /// The opstamp at the last commit is returned.
     pub fn rollback(&mut self) -> crate::Result<Opstamp> {
-        info!("Rolling back to opstamp {}", self.committed_opstamp);
+        debug!("Rolling back to opstamp {}", self.committed_opstamp);
         // marks the segment updater as killed. From now on, all
         // segment updates will be ignored.
         self.segment_updater.kill();
@@ -574,7 +575,8 @@ impl<D: Document> IndexWriter<D> {
             .take()
             .expect("The IndexWriter does not have any lock. This is a bug, please report.");
 
-        let new_index_writer = IndexWriter::new(&self.index, self.options.clone(), directory_lock)?;
+        let new_index_writer =
+            IndexWriter::new(self.index.clone(), self.options.clone(), directory_lock)?;
 
         // the current `self` is dropped right away because of this call.
         //
@@ -626,7 +628,7 @@ impl<D: Document> IndexWriter<D> {
         //
         // This will move uncommitted segments to the state of
         // committed segments.
-        info!("Preparing commit");
+        debug!("Preparing commit");
 
         // this will drop the current document channel
         // and recreate a new one.
@@ -644,7 +646,7 @@ impl<D: Document> IndexWriter<D> {
 
         let commit_opstamp = self.stamper.stamp();
         let prepared_commit = PreparedCommit::new(self, commit_opstamp);
-        info!("Prepared commit {commit_opstamp}");
+        debug!("Prepared commit {commit_opstamp}");
         Ok(prepared_commit)
     }
 

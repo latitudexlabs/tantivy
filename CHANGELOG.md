@@ -1,3 +1,10 @@
+Tantivy 0.27.0
+================================
+
+## Breaking change
+- `.set_fast(..)` now takes a &str. The same behavior as `.set_fast(None)` can be obtained with .set_fast(tantivy::tokenizer::RAW_TOKENIZER_NAME).
+
+
 Tantivy 0.26.1
 ================================
 
@@ -17,6 +24,7 @@ Tantivy 0.26 (Unreleased)
 - Fix integer overflow in segment sorting and merge policy truncation [#2846](https://github.com/quickwit-oss/tantivy/pull/2846)(@anaslimem)
 - Fix merging of intermediate aggregation results [#2719](https://github.com/quickwit-oss/tantivy/pull/2719)(@PSeitz)
 - Fix deduplicate doc counts in term aggregation for multi-valued fields [#2854](https://github.com/quickwit-oss/tantivy/pull/2854)(@nuri-yoo)
+- Honor phrase prefix (`"..."*`) and slop (`"..."~N`) on JSON fields; previously both were silently dropped, degrading the query to an exact phrase [#2966](https://github.com/quickwit-oss/tantivy/pull/2966)(@DavIvek)
 
 ## Features/Improvements
 - **Aggregation**

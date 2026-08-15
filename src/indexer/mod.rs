@@ -8,7 +8,7 @@
 pub(crate) mod delete_queue;
 pub(crate) mod path_to_unordered_id;
 
-pub(crate) mod doc_id_mapping;
+pub mod doc_id_mapping;
 mod doc_opstamp_mapping;
 mod flat_map_with_buffer;
 mod frequent_terms;
@@ -25,7 +25,6 @@ pub(crate) mod prepared_commit;
 mod segment_entry;
 mod segment_manager;
 mod segment_register;
-pub(crate) mod segment_serializer;
 pub(crate) mod segment_updater;
 pub(crate) mod segment_writer;
 pub(crate) mod single_segment_index_writer;
@@ -44,7 +43,6 @@ pub use self::merge_policy::{MergeCandidate, MergePolicy, NoMergePolicy};
 pub use self::operation::{AddOperation, DeleteOperation, UserOperation};
 pub use self::prepared_commit::PreparedCommit;
 pub use self::segment_entry::SegmentEntry;
-pub(crate) use self::segment_serializer::SegmentSerializer;
 pub use self::segment_updater::{merge_filtered_segments, merge_indices};
 pub use self::segment_writer::SegmentWriter;
 pub use self::single_segment_index_writer::SingleSegmentIndexWriter;
@@ -76,13 +74,10 @@ mod tests_mmap {
     use crate::aggregation::AggregationCollector;
     use crate::collector::{Count, TopDocs};
     use crate::index::FieldMetadata;
-    use crate::query::{AllQuery, PhrasePrefixQuery, PhraseQuery, QueryParser, TermQuery};
-    use crate::schema::{
-        IndexRecordOption, JsonObjectOptions, Schema, TextFieldIndexing, TextOptions, Type, FAST,
-        INDEXED, STORED, TEXT,
-    };
-    use crate::WordNgramConfig;
-    use crate::{Index, IndexWriter, Term, WordNgramSet};
+    use crate::query::{AllQuery, QueryParser};
+    use crate::schema::{JsonObjectOptions, Schema, Type, FAST, INDEXED, STORED, TEXT};
+    use crate::tokenizer::RAW_TOKENIZER_NAME;
+    use crate::{Index, IndexWriter, Term};
 
     #[test]
     fn test_advance_delete_bug() -> crate::Result<()> {
@@ -463,8 +458,9 @@ mod tests_mmap {
     fn test_json_fields_metadata(expanded_dots: bool, one_segment: bool) {
         use pretty_assertions::assert_eq;
         let mut schema_builder = Schema::builder();
-        let json_options: JsonObjectOptions =
-            JsonObjectOptions::from(TEXT).set_fast(None).set_stored();
+        let json_options: JsonObjectOptions = JsonObjectOptions::from(TEXT)
+            .set_fast(RAW_TOKENIZER_NAME)
+            .set_stored();
         let json_options = if expanded_dots {
             json_options.set_expand_dots_enabled()
         } else {
@@ -646,8 +642,9 @@ mod tests_mmap {
         /// affect the field name itself.
         use pretty_assertions::assert_eq;
         let mut schema_builder = Schema::builder();
-        let json_options: JsonObjectOptions =
-            JsonObjectOptions::from(TEXT).set_fast(None).set_stored();
+        let json_options: JsonObjectOptions = JsonObjectOptions::from(TEXT)
+            .set_fast(RAW_TOKENIZER_NAME)
+            .set_stored();
         // let json_options = json_options.set_expand_dots_enabled();
         let json_field_shadow = schema_builder.add_json_field("json.shadow", json_options.clone());
         let json_field = schema_builder.add_json_field("json", json_options.clone());

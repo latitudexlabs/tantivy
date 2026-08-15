@@ -241,7 +241,10 @@ impl MmapDirectory {
     fn open_impl_to_avoid_monomorphization(
         directory_path: &Path,
     ) -> Result<MmapDirectory, OpenDirectoryError> {
-        if !directory_path.exists() {
+        let directory_exists = directory_path.try_exists().map_err(|io_err| {
+            OpenDirectoryError::wrap_io_error(io_err, directory_path.to_owned())
+        })?;
+        if !directory_exists {
             return Err(OpenDirectoryError::DoesNotExist(PathBuf::from(
                 directory_path,
             )));
@@ -254,9 +257,14 @@ impl MmapDirectory {
             {
                 // `canonicalize` returns "Incorrect function" (error code 1)
                 // for virtual drives (network drives, ramdisk, etc.).
-                if io_err.raw_os_error() == Some(1) && directory_path.exists() {
-                    // Should call `std::path::absolute` when it is stabilised.
-                    return Ok(directory_path);
+                if io_err.raw_os_error() == Some(1) {
+                    let directory_exists = directory_path.try_exists().map_err(|io_err| {
+                        OpenDirectoryError::wrap_io_error(io_err, directory_path.clone())
+                    })?;
+                    if directory_exists {
+                        // Should call `std::path::absolute` when it is stabilised.
+                        return Ok(directory_path);
+                    }
                 }
             }
 
@@ -675,9 +683,10 @@ mod tests {
             reader.reload().unwrap();
             let num_segments = reader.searcher().segment_readers().len();
             assert!(num_segments <= 4);
-            let num_components_except_deletes_and_tempstore =
-                crate::index::SegmentComponent::iterator().len() - 2;
-            let max_num_mmapped = num_components_except_deletes_and_tempstore * num_segments;
+            // Built-in segment components excluding the delete file (no deletes here):
+            // postings, positions, fast fields, field norms, terms, store, temp store.
+            let max_components_per_segment = 7;
+            let max_num_mmapped = max_components_per_segment * num_segments;
             assert_eventually(|| {
                 let num_mmapped = mmap_directory.get_cache_info().mmapped.len();
                 if num_mmapped > max_num_mmapped {
